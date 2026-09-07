@@ -1,0 +1,734 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://simo.example/contracts/runtime/haystack-agent-serving.schema.json",
+  "title": "Haystack Agent Serving Contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "profile",
+    "agent_graph",
+    "policy_router",
+    "model_bindings",
+    "mcp_bindings",
+    "skill_bindings",
+    "mcp_registry",
+    "skills_registry",
+    "prompt_bindings",
+    "observability"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "profile": {
+      "$ref": "#/$defs/profile"
+    },
+    "agent_graph": {
+      "$ref": "#/$defs/agent_graph"
+    },
+    "policy_router": {
+      "$ref": "#/$defs/policy_router"
+    },
+    "model_bindings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/model_binding"
+      },
+      "minItems": 1
+    },
+    "mcp_bindings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/mcp_binding"
+      }
+    },
+    "skill_bindings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/skill_binding"
+      }
+    },
+    "mcp_registry": {
+      "$ref": "#/$defs/mcp_registry"
+    },
+    "skills_registry": {
+      "$ref": "#/$defs/skills_registry"
+    },
+    "prompt_bindings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/prompt_binding"
+      }
+    },
+    "observability": {
+      "$ref": "#/$defs/observability"
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9._-]{0,127}$"
+    },
+    "logical_ref": {
+      "type": "string",
+      "pattern": "^(?!agent_)(?!system\\.ai\\.)[a-z][a-z0-9._-]{0,127}$"
+    },
+    "model_ref": {
+      "type": "string",
+      "oneOf": [
+        {
+          "pattern": "^model-services/simo_prod\\.ai_models\\.route_[a-z0-9][a-z0-9_-]{0,127}$"
+        },
+        {
+          "pattern": "^(?!agent_)(?!system\\.ai\\.)[a-z][a-z0-9._-]{0,127}$"
+        }
+      ]
+    },
+    "protocol": {
+      "type": "string",
+      "enum": [
+        "chat_completions",
+        "responses",
+        "anthropic_messages",
+        "cursor_chat_completions",
+        "openai_responses"
+      ]
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/logical_ref"
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][a-z0-9.-]+)?$"
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 1000
+        }
+      }
+    },
+    "agent_graph": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "entry_node",
+        "terminal_nodes",
+        "nodes",
+        "edges"
+      ],
+      "properties": {
+        "entry_node": {
+          "$ref": "#/$defs/identifier"
+        },
+        "terminal_nodes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/identifier"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "nodes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/graph_node"
+          },
+          "minItems": 1
+        },
+        "edges": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/graph_edge"
+          }
+        }
+      }
+    },
+    "graph_node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "input",
+            "model",
+            "tool",
+            "router",
+            "approval",
+            "output"
+          ]
+        },
+        "model_binding": {
+          "$ref": "#/$defs/identifier"
+        },
+        "mcp_binding": {
+          "$ref": "#/$defs/identifier"
+        },
+        "skill_bindings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/identifier"
+          },
+          "uniqueItems": true
+        },
+        "prompt_bindings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/identifier"
+          },
+          "uniqueItems": true
+        },
+        "policy_route": {
+          "$ref": "#/$defs/identifier"
+        }
+      }
+    },
+    "graph_edge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "target"
+      ],
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/identifier"
+        },
+        "target": {
+          "$ref": "#/$defs/identifier"
+        },
+        "condition": {
+          "type": "string",
+          "maxLength": 256
+        }
+      }
+    },
+    "policy_router": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "default_action",
+        "routes"
+      ],
+      "properties": {
+        "default_action": {
+          "type": "string",
+          "enum": [
+            "allow",
+            "deny",
+            "require_approval"
+          ]
+        },
+        "routes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/policy_route"
+          }
+        }
+      }
+    },
+    "policy_route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "priority",
+        "when",
+        "action"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "priority": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "when": {
+          "$ref": "#/$defs/predicate"
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "allow",
+            "deny",
+            "require_approval"
+          ]
+        },
+        "model_binding": {
+          "$ref": "#/$defs/identifier"
+        },
+        "mcp_binding": {
+          "$ref": "#/$defs/identifier"
+        },
+        "max_steps": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "max_tokens": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000000
+        }
+      }
+    },
+    "predicate": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/leaf_predicate"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "all"
+          ],
+          "properties": {
+            "all": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/predicate"
+              },
+              "minItems": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "any"
+          ],
+          "properties": {
+            "any": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/predicate"
+              },
+              "minItems": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "not"
+          ],
+          "properties": {
+            "not": {
+              "$ref": "#/$defs/predicate"
+            }
+          }
+        }
+      ]
+    },
+    "leaf_predicate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attribute",
+        "operator"
+      ],
+      "properties": {
+        "attribute": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9._-]{0,127}$"
+        },
+        "operator": {
+          "type": "string",
+          "enum": [
+            "equals",
+            "in",
+            "exists"
+          ]
+        },
+        "value": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "array",
+            "null"
+          ]
+        }
+      }
+    },
+    "model_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "ref",
+        "protocol"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "ref": {
+          "$ref": "#/$defs/model_ref"
+        },
+        "protocol": {
+          "$ref": "#/$defs/protocol"
+        },
+        "streaming": {
+          "type": "boolean"
+        },
+        "tools": {
+          "type": "boolean"
+        },
+        "structured_output": {
+          "type": "boolean"
+        }
+      }
+    },
+    "mcp_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "ref"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "ref": {
+          "$ref": "#/$defs/logical_ref"
+        },
+        "tools": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9._:-]{0,127}$"
+          },
+          "uniqueItems": true
+        },
+        "transport": {
+          "type": "string",
+          "enum": [
+            "streamable_http",
+            "sse",
+            "stdio"
+          ]
+        }
+      }
+    },
+    "skill_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "ref"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "ref": {
+          "$ref": "#/$defs/logical_ref"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "store_ref": {
+          "$ref": "#/$defs/logical_ref"
+        },
+        "manifest_path": {
+          "$ref": "#/$defs/safe_relative_path"
+        },
+        "load_mode": {
+          "type": "string",
+          "enum": [
+            "metadata",
+            "lazy_body"
+          ]
+        }
+      }
+    },
+    "mcp_registry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "registry_version",
+        "servers"
+      ],
+      "properties": {
+        "registry_version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+$"
+        },
+        "servers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/mcp_server"
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "mcp_server": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "protocol",
+        "source_kind",
+        "source_ref",
+        "allowed_tools"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "protocol": {
+          "type": "string",
+          "enum": [
+            "streamable_http",
+            "sse",
+            "stdio"
+          ]
+        },
+        "source_kind": {
+          "type": "string",
+          "enum": [
+            "databricks_mcp",
+            "external_mcp",
+            "local_fixture"
+          ]
+        },
+        "source_ref": {
+          "$ref": "#/$defs/logical_ref"
+        },
+        "auth_ref": {
+          "$ref": "#/$defs/logical_ref"
+        },
+        "allowed_tools": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9._:-]{0,127}$"
+          },
+          "uniqueItems": true
+        },
+        "refresh_seconds": {
+          "type": "integer",
+          "minimum": 30,
+          "maximum": 86400
+        }
+      }
+    },
+    "skills_registry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "registry_version",
+        "stores",
+        "skills"
+      ],
+      "properties": {
+        "registry_version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+$"
+        },
+        "stores": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/skill_store"
+          },
+          "uniqueItems": true
+        },
+        "skills": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/skill_manifest"
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "skill_store": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "ref"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "databricks_uc_volume",
+            "workspace_files",
+            "local_fixture"
+          ]
+        },
+        "ref": {
+          "$ref": "#/$defs/logical_ref"
+        },
+        "read_only": {
+          "const": true
+        }
+      }
+    },
+    "skill_manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "store_ref",
+        "manifest_path",
+        "version",
+        "content_sha256",
+        "load_mode"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "store_ref": {
+          "$ref": "#/$defs/identifier"
+        },
+        "manifest_path": {
+          "$ref": "#/$defs/safe_relative_path"
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][a-z0-9.-]+)?$"
+        },
+        "content_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "load_mode": {
+          "type": "string",
+          "enum": [
+            "metadata",
+            "lazy_body"
+          ]
+        }
+      }
+    },
+    "prompt_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "role",
+        "ref",
+        "allowed_variables",
+        "user_override",
+        "max_length"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "role": {
+          "type": "string",
+          "enum": [
+            "system",
+            "developer",
+            "user"
+          ]
+        },
+        "ref": {
+          "$ref": "#/$defs/logical_ref"
+        },
+        "allowed_variables": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/identifier"
+          },
+          "uniqueItems": true
+        },
+        "user_override": {
+          "const": false
+        },
+        "max_length": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100000
+        },
+        "content_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "observability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "trace_enabled",
+        "sampling_ratio",
+        "capture_content",
+        "redaction_policy",
+        "metric_namespace",
+        "emit_tool_events",
+        "emit_model_events"
+      ],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "databricks_ui",
+            "serving_metrics_only"
+          ]
+        },
+        "trace_enabled": {
+          "const": false
+        },
+        "sampling_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "capture_content": {
+          "const": false
+        },
+        "redaction_policy": {
+          "const": "strict"
+        },
+        "metric_namespace": {
+          "$ref": "#/$defs/logical_ref"
+        },
+        "emit_tool_events": {
+          "type": "boolean"
+        },
+        "emit_model_events": {
+          "type": "boolean"
+        }
+      }
+    },
+    "safe_relative_path": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9._/-]{1,255}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    }
+  }
+}

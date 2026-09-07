@@ -1,0 +1,19 @@
+---
+features:
+  - |
+    Added an initial Databricks model-service registry and a read-only control-plane
+    skeleton for route-based agent serving configuration. The registry discovers only
+    approved ``model-services/simo_prod.ai_models.route_*`` resources and records their
+    supported APIs, routing, rate limits, ETags, and cache expiry.
+    Added local protocol adapters for MLflow Chat/Responses, OpenAI Responses,
+    Anthropic Messages, and Cursor Chat envelopes.
+enhancements:
+  - |
+    Added a declarative runtime contract for agent graphs, policy routers, model/MCP/
+    skill bindings, registries, prompt variable policies, immutable snapshots, and
+    last-known-good reload behavior. Observability is explicitly configured for
+    Databricks UI/serving metrics without enabling an additional MLflow trace exporter.
+security:
+  - |
+    Runtime configuration rejects ``system.ai.*`` model references, arbitrary Python
+    import configuration, ``agent_`` resources, and Supervisor Agent references.
