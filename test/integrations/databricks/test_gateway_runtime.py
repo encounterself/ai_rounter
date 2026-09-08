@@ -3,7 +3,61 @@ from __future__ import annotations
 import httpx
 
 from integrations.databricks.ai_gateway import GatewayConfig, ModelProvider, ModelRoute
-from integrations.databricks.gateway import AnthropicBackend, GatewayRuntime, OpenAICompatibleBackend
+from integrations.databricks.gateway import (
+    AnthropicBackend,
+    DatabricksFoundationModelBackend,
+    GatewayRuntime,
+    OpenAICompatibleBackend,
+)
+from integrations.databricks.protocols import InternalMessage, InternalRequest
+
+
+def test_databricks_foundation_model_backend_uses_chat_contract() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-smoke",
+                "object": "chat.completion",
+                "model": "databricks-gpt-5-mini",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "smoke-ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
+            },
+            request=request,
+        )
+
+    backend = DatabricksFoundationModelBackend(
+        "https://workspace.example",
+        "databricks-gpt-5-mini",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        response = backend.invoke(
+            request=InternalRequest(
+                messages=(
+                    InternalMessage(role="user", content="hello"),
+                ),
+                max_tokens=16,
+            ),
+            request_id="test-request",
+        )
+    finally:
+        backend.close()
+
+    assert backend.protocol == "chat_completions"
+    assert requests[0].url.path == "/serving-endpoints/databricks-gpt-5-mini/invocations"
+    assert response.messages[0].content == "smoke-ok"
+    assert response.usage is not None
+    assert response.usage.total_tokens == 4
 
 
 def test_codex_compatible_provider_uses_explicit_http_path_without_shell() -> None:

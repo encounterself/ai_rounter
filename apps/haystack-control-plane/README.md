@@ -1,11 +1,13 @@
 # Haystack Control Plane
 
-This directory contains a small Databricks App control plane for drafting and publishing Haystack runtime configuration. It is intentionally server-first: the browser talks to same-origin `/api` routes, while the Node server owns Databricks authentication and any future provider credentials.
+This directory contains a deployable Databricks App control plane for drafting and publishing Haystack runtime configuration. It is intentionally server-first: the browser talks to same-origin `/api` routes, while the Node server owns Databricks authentication and provider credentials.
 
 ## Current capabilities
 
 - React/Vite UI for model services and routes, protocol settings, agent graph, MCP bindings, skills, prompts, releases, rollback, and audit events.
 - Server-side health, Databricks resource discovery, model-service discovery, permissions identity summary, and serving-endpoint invocation proxy.
+- A `serving_endpoint` App resource binding for `haystack-agent-router`, injected as `DATABRICKS_SERVING_ENDPOINT_NAME` with `CAN_QUERY` permission.
+- A working web console for selecting discovered endpoints, choosing `agent/v1/responses`, selecting an AI Gateway/model route, and issuing a server-side invocation.
 - Draft → publish → rollback state transitions through a store interface.
 - A `ControlPlaneStore` provider contract with `getState`, `saveDraft`, `publish`, and `rollback` methods; memory and JSON-file implementations are included, while Postgres/Lakebase is an explicit degraded provider until a database adapter is injected.
 - File-backed control-plane storage when `CONTROL_PLANE_STORE=file:/absolute/path.json` is configured.
@@ -14,9 +16,9 @@ This directory contains a small Databricks App control plane for drafting and pu
 
 ## Not included yet
 
-This implementation does **not** claim to provide production Claude, Codex, MCP, Skills, prompt execution, or AI Gateway routing. The UI stores references and policy JSON; it does not execute agent graphs or create Databricks resources. A production deployment still needs:
+This implementation does not claim to execute provider-specific Claude, Codex, MCP, Skills, or prompt runtimes yet. It provides the serving boundary and protocol extension point those runtimes can use. A production deployment still needs:
 
-- An App resource binding that injects `DATABRICKS_HOST`, `DATABRICKS_TOKEN`, and a durable `CONTROL_PLANE_STORE` provider.
+- A durable `CONTROL_PLANE_STORE` provider. App authentication is server-side: the app accepts a platform-injected token, App OAuth client credentials, or a forwarded user access token; none is returned to the browser.
 - A real Postgres/Lakebase repository adapter for the `test_ontos` project. A `postgres://` store URL currently reports a visible degraded state rather than silently mocking persistence.
 - Serving endpoint configuration and an authenticated runtime that implements the desired protocol adapters, model routing, fallback, streaming, and provider-specific semantics.
 - Runtime adapters for Claude, Codex-compatible APIs, MCP transports, skill loading, prompt resolution, permissions, and audit/trace emission.
@@ -31,6 +33,8 @@ The default read-only source identifier is `simo_prod.mysql_cdc_sync`. It is dis
 | --- | --- | --- |
 | `DATABRICKS_HOST` | Databricks workspace URL, server-side only | unset; resource calls are degraded |
 | `DATABRICKS_TOKEN` | App-injected Databricks credential, server-side only | unset; never sent to the browser |
+| `DATABRICKS_CLIENT_ID` / `DATABRICKS_CLIENT_SECRET` | Optional App OAuth credentials for server-side token acquisition | unset |
+| `DATABRICKS_SERVING_ENDPOINT_NAME` | App resource binding value | `haystack-agent-router` |
 | `MODEL_SERVICE_PARENT` | Model service name filter | `simo_prod.ai_models` |
 | `MODEL_SERVICE_PREFIX` | Model service name prefix/filter | `route_` |
 | `CONTROL_PLANE_STORE` | `file:/absolute/path.json` or future provider URL | unset; empty in-memory degraded mode |
@@ -68,9 +72,22 @@ npm run start
 - `POST /api/config/publish` — publish a server-side snapshot.
 - `POST /api/config/rollback` — restore a published revision.
 - `GET /api/resources` — read-only Apps, serving endpoints, model services, Unity Catalog schema, and Lakebase project discovery.
+- `GET /api/serving-endpoints` — list serving endpoints visible to the App and expose the bound endpoint name without credentials.
 - `GET /api/model-services` — filtered model-service discovery.
 - `GET /api/permissions` — server identity summary; resource-specific permissions still require explicit checks.
 - `POST /api/gateway/request` — server-side proxy to a named Databricks serving endpoint invocation.
+
+## Deploy as a Databricks App
+
+The included `app.yaml` is directly deployable with the Databricks Apps CLI. It binds `haystack-agent-router` with `CAN_QUERY` and injects only its endpoint name into the process. The optional `databricks.yml` defines the equivalent bundle resource under this directory.
+
+```bash
+databricks apps validate . --profile <PROFILE>
+databricks apps deploy haystack-control-plane --source-code-path . --profile <PROFILE>
+databricks apps get haystack-control-plane --profile <PROFILE>
+```
+
+The App service principal must be allowed to query the endpoint. The browser only calls same-origin routes; it never receives a Databricks token.
 
 ## Tests
 

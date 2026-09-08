@@ -2,6 +2,7 @@
 
 from .backends import (
     AnthropicBackend,
+    DatabricksFoundationModelBackend,
     DatabricksServingBackend,
     GatewayBackend,
     GatewayBackendError,
@@ -13,6 +14,7 @@ from .runtime import GatewayResult, GatewayRuntime, GatewayRuntimeError, Request
 
 __all__ = [
     "AnthropicBackend",
+    "DatabricksFoundationModelBackend",
     "DatabricksServingBackend",
     "GatewayBackend",
     "GatewayBackendError",

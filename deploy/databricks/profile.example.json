@@ -1,25 +1,79 @@
 {
-  "default_route": "model-services/simo_prod.ai_models.route_claude-haiku-4-5",
+  "default_route": "serving-endpoints/databricks-claude-haiku-4-5",
   "route_metadata": {
-    "provider": "anthropic-compatible",
-    "model": "claude-haiku-4-5",
+    "backend": "databricks_serving",
+    "endpoint": "databricks-claude-haiku-4-5",
+    "provider": "databricks-system-ai",
+    "model": "databricks-claude-haiku-4-5",
     "protocol": "chat",
     "mcp_binding": "approved-mcp-binding",
     "skill_binding": "approved-skill-binding",
     "prompt_binding": "approved-prompt-binding"
   },
+  "route_metadata_by_route": {
+    "serving-endpoints/databricks-claude-haiku-4-5": {
+      "backend": "databricks_serving",
+      "endpoint": "databricks-claude-haiku-4-5",
+      "provider": "databricks-system-ai",
+      "model": "databricks-claude-haiku-4-5",
+      "protocol": "chat",
+      "mcp_binding": "approved-mcp-binding",
+      "skill_binding": "approved-skill-binding",
+      "prompt_binding": "approved-prompt-binding"
+    },
+    "serving-endpoints/databricks-kimi-k3": {
+      "backend": "databricks_serving",
+      "endpoint": "databricks-kimi-k3",
+      "provider": "databricks-system-ai",
+      "model": "databricks-kimi-k3",
+      "protocol": "chat",
+      "mcp_binding": "approved-mcp-binding",
+      "skill_binding": "approved-skill-binding",
+      "prompt_binding": "approved-prompt-binding"
+    },
+    "serving-endpoints/databricks-gpt-5-6-luna": {
+      "backend": "databricks_serving",
+      "endpoint": "databricks-gpt-5-6-luna",
+      "provider": "databricks-system-ai",
+      "model": "databricks-gpt-5-6-luna",
+      "protocol": "chat",
+      "mcp_binding": "approved-mcp-binding",
+      "skill_binding": "approved-skill-binding",
+      "prompt_binding": "approved-prompt-binding"
+    },
+    "model-services/simo_prod.ai_models.route_claude-sonnet-5": {
+      "provider": "anthropic-compatible",
+      "model": "claude-sonnet-5",
+      "protocol": "chat",
+      "mcp_binding": "approved-mcp-binding",
+      "skill_binding": "approved-skill-binding",
+      "prompt_binding": "approved-prompt-binding"
+    },
+    "model-services/simo_prod.ai_models.route_gpt-5-5": {
+      "provider": "openai-compatible",
+      "model": "gpt-5-5",
+      "protocol": "responses",
+      "mcp_binding": "approved-mcp-binding",
+      "skill_binding": "approved-skill-binding",
+      "prompt_binding": "approved-prompt-binding"
+    }
+  },
   "gateway": {
     "workspace_id": null,
+    "workspace_host": null,
+    "client_id_secret_ref": null,
+    "client_secret_secret_ref": null,
     "protocol": "chat",
     "allowed_routes": [],
     "timeout_seconds": 60
   },
   "tracing": {
-    "enabled": false,
-    "experiment_name": null,
-    "sampling_ratio": 0.0,
+    "enabled": true,
+    "experiment_name": "/Users/dean.he@simo.co/haystack-agent-router-deploy",
+    "experiment_id": "1575579281444652",
+    "sampling_ratio": 1.0,
     "capture_content": false,
-    "beta": false,
+    "beta": true,
     "destination": null,
     "sql_warehouse_id": null,
     "uc_catalog": null,

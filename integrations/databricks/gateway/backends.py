@@ -217,6 +217,38 @@ class DatabricksServingBackend(_HTTPGatewayBackend):
         self.endpoint_name = endpoint_name
 
 
+class DatabricksFoundationModelBackend(DatabricksServingBackend):
+    """Backend for a Databricks ``system.ai`` chat endpoint.
+
+    Foundation Model API endpoints use the OpenAI-compatible ``llm/v1/chat``
+    contract.  The invocation URL is still the standard Serving Endpoint path,
+    but naming the backend explicitly prevents callers from accidentally using
+    an MLflow Responses protocol for a chat endpoint.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        endpoint_name: str,
+        *,
+        token: str | None = None,
+        client: httpx.Client | None = None,
+        transport: httpx.BaseTransport | None = None,
+        timeout: float | httpx.Timeout = 60.0,
+        model: str | None = None,
+    ) -> None:
+        super().__init__(
+            host,
+            endpoint_name,
+            protocol="chat_completions",
+            token=token,
+            client=client,
+            transport=transport,
+            timeout=timeout,
+            model=model,
+        )
+
+
 class OpenAICompatibleBackend(_HTTPGatewayBackend):
     """Backend for an explicitly configured OpenAI/Codex-compatible HTTP API.
 
@@ -314,6 +346,7 @@ def _redact(value: str) -> str:
 
 __all__ = [
     "AnthropicBackend",
+    "DatabricksFoundationModelBackend",
     "DatabricksServingBackend",
     "GatewayBackend",
     "GatewayBackendError",

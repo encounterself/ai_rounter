@@ -61,7 +61,10 @@ class TracingConfig:
             configured = {}
 
         def value(key: str, env_name: str, default: Any = None) -> Any:
-            return os.getenv(env_name, configured.get(key, default))
+            environment_value = os.getenv(env_name)
+            if environment_value not in (None, ""):
+                return environment_value
+            return configured.get(key, default)
 
         enabled = _as_bool(value("enabled", "MLFLOW_TRACING_ENABLED", False))
         sampling_default = 1.0 if enabled else 0.0
@@ -155,7 +158,7 @@ class TraceSpan:
             }.items():
                 if value:
                     try:
-                        os.environ.setdefault(env_name, value)
+                        os.environ[env_name] = value
                     except Exception:
                         pass
 

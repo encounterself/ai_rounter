@@ -35,7 +35,7 @@ export function createControlPlaneServer(environment = process.env) {
 
     if (request.url?.startsWith("/api/")) {
       const body = await readRequestBody(request);
-      const result = await api({ method: request.method || "GET", url: request.url, body });
+      const result = await api({ method: request.method || "GET", url: request.url, body, headers: request.headers });
       response.writeHead(result.status, {
         ...result.headers,
         "cache-control": "no-store",

@@ -16,13 +16,28 @@ if __package__:
     from .serving_runtime import LocalServingRuntime
     from .tracing import TracingConfig
 else:
+    def _code_path_directories() -> list[str]:
+        """Find the directory containing sibling modules in an MLflow model image."""
+
+        model_root = Path(__file__).resolve().parent
+        candidates = [model_root, *model_root.rglob("gateway_client.py")]
+        directories: list[str] = []
+        for candidate in candidates:
+            directory = candidate if candidate.is_dir() else candidate.parent
+            if (directory / "gateway_client.py").is_file() and str(directory) not in directories:
+                directories.append(str(directory))
+        return directories
+
     def _code_path_package() -> str:
         """Create a package namespace for MLflow's top-level script loading mode."""
 
         package_name = "_haystack_databricks_code"
         if package_name not in sys.modules:
             package = ModuleType(package_name)
-            setattr(package, "__path__", [str(Path(__file__).resolve().parent)])
+            directories = _code_path_directories()
+            if not directories:
+                raise ModuleNotFoundError("gateway_client.py is not present in the MLflow code paths")
+            setattr(package, "__path__", directories)
             package.__package__ = package_name
             sys.modules[package_name] = package
         return package_name
@@ -99,10 +114,15 @@ def normalize_request(request: Any) -> dict[str, Any]:
         items = [{"role": "user", "content": items}]
     if not isinstance(items, list):
         raise ValueError("input must be a list or string")
+    custom_inputs = _request_value(request, "custom_inputs", {})
+    if not isinstance(custom_inputs, Mapping):
+        custom_inputs = {}
+    requested_model = _request_value(request, "model") or custom_inputs.get("model")
     return {
         "input": items,
         "stream": bool(_request_value(request, "stream", False)),
-        "model": _request_value(request, "model"),
+        "model": requested_model,
+        "metadata": _request_value(request, "metadata", {}),
         "correlation_id": _request_value(request, "correlation_id"),
         "request_id": _request_value(request, "request_id"),
     }
@@ -136,6 +156,15 @@ class Agent(ResponsesAgent):
         )
         self.profile = loaded_profile
 
+    def _route_metadata(self, route: str) -> Mapping[str, Any]:
+        route_metadata = self.profile.get("route_metadata", {}) if self.profile else {}
+        by_route = self.profile.get("route_metadata_by_route", {}) if self.profile else {}
+        if isinstance(by_route, Mapping) and isinstance(by_route.get(route), Mapping):
+            return by_route[route]
+        if self.profile and route != self.profile.get("default_route"):
+            return {}
+        return route_metadata if isinstance(route_metadata, Mapping) else {}
+
     def load_context(self, context: Any) -> None:
         """Load and validate the injected profile artifact/model configuration."""
 
@@ -159,13 +188,14 @@ class Agent(ResponsesAgent):
                 raise ProfileError("profile_missing", "load_context must load a profile before predict")
             if normalized["stream"]:
                 return self._error_response(correlation_id, "use_predict_stream", "StreamingRequestError")
+            route = str(normalized.get("model") or self.profile["default_route"])
             result = self.runtime._execute({
                 "payload": {"input": normalized["input"], "stream": False},
                 "stream": False,
                 "model": normalized.get("model"),
                 "request_id": normalized.get("request_id"),
-                "route": self.profile["default_route"],
-                "route_metadata": self.profile["route_metadata"],
+                "route": route,
+                "route_metadata": self._route_metadata(route),
                 "correlation_id": correlation_id,
             })
             if isinstance(result, Mapping) and result.get("status") == "failed":
@@ -185,13 +215,14 @@ class Agent(ResponsesAgent):
             normalized = normalize_request(request)
             if self.profile is None or self.runtime is None:
                 raise ProfileError("profile_missing", "load_context must load a profile before predict_stream")
+            route = str(normalized.get("model") or self.profile["default_route"])
             result = self.runtime._execute({
                 "payload": {"input": normalized["input"], "stream": True},
                 "stream": True,
                 "model": normalized.get("model"),
                 "request_id": normalized.get("request_id"),
-                "route": self.profile["default_route"],
-                "route_metadata": self.profile["route_metadata"],
+                "route": route,
+                "route_metadata": self._route_metadata(route),
                 "correlation_id": correlation_id,
             })
             if isinstance(result, Mapping):
@@ -244,7 +275,11 @@ class Agent(ResponsesAgent):
         safe_diagnostic.setdefault("error_code", error_code)
         safe_diagnostic = {key: value for key, value in safe_diagnostic.items() if value is not None}
         if ResponsesAgentResponse is not None:
-            return ResponsesAgentResponse(output=[], custom_outputs={"error": safe_diagnostic})
+            item = self.create_text_output_item(
+                text=f"Haystack runtime request failed: {error_code}",
+                id=f"error_{uuid4().hex}",
+            )
+            return ResponsesAgentResponse(output=[item], status="failed", custom_outputs={"error": safe_diagnostic})
         return {"status": "failed", "error": safe_diagnostic}
 
     def _responses_stream(self, result: Iterator[dict[str, Any]], correlation_id: str) -> Iterator[Any]:

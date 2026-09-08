@@ -4,16 +4,18 @@ This directory contains the reproducible source for an MLflow 3.1+ `python_funct
 
 ## Configuration
 
-Copy `deploy/databricks/profile.example.json` and provide a real profile outside source control. Set either non-secret `DATABRICKS_AI_GATEWAY_BASE_URL` or `DATABRICKS_WORKSPACE_ID`; an explicit base URL takes precedence, otherwise the client constructs `https://<workspace_id>.ai-gateway.cloud.databricks.com`. Authentication comes from Databricks SDK managed auth; do not add `DATABRICKS_TOKEN`, Claude tokens, Codex tokens, or old endpoint credentials.
+Copy `deploy/databricks/profile.example.json` and provide a real profile outside source control. Set non-secret `DATABRICKS_HOST` (or `gateway.workspace_host` in the profile); the client constructs `<workspace-host>/ai-gateway/mlflow/v1`. An explicit `DATABRICKS_AI_GATEWAY_BASE_URL` takes precedence. Authentication comes from Databricks SDK managed auth; do not add `DATABRICKS_TOKEN`, Claude tokens, Codex tokens, or old endpoint credentials.
 
-The default route is `model-services/simo_prod.ai_models.route_claude-haiku-4-5`. Routes with the `model-services/` prefix are validated, and an explicitly configured `allowed_routes` list may add another approved route. Provider/model metadata is carried by the profile so Claude-compatible, Codex-compatible, and other backends can be selected by route without claiming that any backend is already connected.
+The example profile defaults to `system-ai/databricks-gpt-5-mini`, a direct Databricks Foundation Model API route. A `system-ai/<endpoint>` route must have matching metadata with `backend: "databricks_serving"`, an endpoint name, and a chat protocol. The runtime calls the workspace Serving API directly and does not send this route through the AI Gateway Model Services API. Existing `model-services/` routes remain supported for deployments that have access to those services.
+
+The example profile also includes `serving-endpoints/databricks-kimi-k3` and `serving-endpoints/databricks-gpt-5-6-luna`. Select one by setting `gateway.route` or `DATABRICKS_MODEL_ROUTE`; route metadata is selected by the route identifier. The `serving-endpoints/<endpoint>` form is equivalent to a `system-ai/<id>` route whose metadata declares the endpoint backend.
 
 ## Register a new version
 
 1. Use MLflow 3.1+ Managed MLflow and install `deploy/databricks/requirements.txt` (`mlflow>=3.1.0,<4`, `databricks-agents>=1.2.0`) in the build image. Managed MLflow access and the endpoint identity's experiment permissions are operator prerequisites.
 2. Register `Agent` as the MLflow `python_function`/`ResponsesAgent` code-model entrypoint, package `deploy/databricks` as `code_path`, and register a new model version through the operator's normal MLflow flow. The model module calls `mlflow.models.set_model`; this repository does not perform that registration remotely.
 3. Inject `profile.json` as a model artifact named `profile` (or provide equivalent model config). `load_context` validates `default_route` and `route_metadata`; it never falls back to an empty profile.
-4. Configure only non-secret endpoint environment values: `DATABRICKS_WORKSPACE_ID` or `DATABRICKS_AI_GATEWAY_BASE_URL` (the latter wins). Do not configure `DATABRICKS_TOKEN`; authentication uses Databricks SDK managed auth.
+4. Configure only non-secret endpoint environment values: `DATABRICKS_WORKSPACE_ID` plus `DATABRICKS_HOST` (or an explicit `DATABRICKS_AI_GATEWAY_BASE_URL`). Do not configure `DATABRICKS_TOKEN`; authentication uses OBO when available, otherwise optional secret-backed OAuth M2M references.
 5. Validate with the Responses request above and inspect `error` when `status` is `failed`. Diagnostics never include authorization, tokens, complete prompts, or MCP/skill secrets.
 
 ### Copyable notebook registration skeleton
@@ -47,7 +49,46 @@ with mlflow.start_run():
 print(model_info.model_uri)
 ```
 
-The endpoint environment for this model contains only one of these non-secret values: `DATABRICKS_WORKSPACE_ID=<WORKSPACE_ID>` or `DATABRICKS_AI_GATEWAY_BASE_URL=https://<AI_GATEWAY_HOST>`. Do not put `DATABRICKS_TOKEN` in the endpoint environment. If the serving integration injects model configuration instead of an artifact, omit `artifacts={"profile": ...}` and inject equivalent non-secret `model_config`; `Agent.load_context` accepts either the `profile` artifact or validated model config.
+For a `system-ai/<endpoint>` route, the endpoint environment must include non-secret `DATABRICKS_HOST=https://<WORKSPACE_HOST>` so the runtime can call `/serving-endpoints/<endpoint>/invocations` directly. For an AI Gateway `model-services/` route, use `DATABRICKS_HOST` or an explicit `DATABRICKS_AI_GATEWAY_BASE_URL`. Do not put `DATABRICKS_TOKEN` in the endpoint environment. If the serving integration injects model configuration instead of an artifact, omit `artifacts={"profile": ...}` and inject equivalent non-secret `model_config`; `Agent.load_context` accepts either the `profile` artifact or validated model config.
+
+### Optional secret-backed OAuth M2M
+
+Do not put OAuth values in source, model artifacts, or endpoint JSON. If OBO is unavailable and the operator has approved a Databricks secret scope/key, set only reference strings in the operator-managed profile or publisher arguments:
+
+```json
+{
+  "gateway": {
+    "client_id_secret_ref": "{{secrets/<scope>/<client-id-key>}}",
+    "client_secret_secret_ref": "{{secrets/<scope>/<client-secret-key>}}"
+  }
+}
+```
+
+The publisher copies those references—not their values—to `DATABRICKS_CLIENT_ID` and `DATABRICKS_CLIENT_SECRET` in `environment_vars`. Serving runtime uses OAuth M2M first when both variables are injected; otherwise it falls back to OBO. The runtime never reads or logs the secret values itself; the Databricks Serving secret-reference resolver and SDK consume them. Use `--client-id-secret-ref` and `--client-secret-secret-ref` only after the scope/key values are confirmed. This change does not create or modify secrets.
+
+### Reproducible registration and endpoint publication
+
+`publish_current_model.py` is the operator entry point for publishing the current repository code rather than reusing an older registered version. Run it in a Databricks notebook or deployment job with Managed MLflow authentication and the dependencies in `requirements.txt`:
+
+```bash
+python deploy/databricks/publish_current_model.py \
+  --deploy-dir deploy/databricks \
+  --profile /path/to/profile.json \
+  --model-name simo_prod.mysql_cdc_sync.haystack_agent_router \
+  --endpoint-name haystack-agent-router \
+  --workspace-id <WORKSPACE_ID> \
+  --owner <OWNER> \
+  --config-out /tmp/haystack-agent-router-update.json
+
+databricks serving-endpoints update-config haystack-agent-router \
+  --json @/tmp/haystack-agent-router-update.json \
+  --profile DEFAULT \
+  --no-wait
+```
+
+The script registers `deploy/databricks/agent.py` with all sibling modules in `code_paths`, resolves the newly registered version, and writes a complete `served_entities` plus `traffic_config` body. It does not call the Serving REST API. Use `--update-endpoint --cli-profile DEFAULT` to invoke the official CLI from the same process; endpoint tags are preserved because `update-config` receives only the update body. It only injects the non-secret workspace ID; provider credentials and PATs must remain in managed authentication or server-side secret references.
+
+Serving places MLflow `code_paths` below `/model/code`, rather than beside `/model/agent.py`. The top-level model loader therefore searches nested code directories before importing `gateway_client.py`, `profile_loader.py`, `serving_runtime.py`, and `tracing.py`. Without this lookup, the model can register successfully but fail to load with `No module named '_haystack_databricks_code.gateway_client'`.
 
 The `mlflow.models.set_model` call is the code-model registration hook, not an endpoint deployment call. Keep `deploy/databricks` in `code_paths` so top-level code-path imports work, and keep the profile outside source control. Register a new version only after the model URI and profile have been reviewed.
 
@@ -55,7 +96,7 @@ The `mlflow.models.set_model` call is the code-model registration hook, not an e
 
 ### Why an endpoint can stay on the old model
 
-The production endpoint was not updated because the new model version never finished registering. MLflow loaded `agent.py` as a top-level code model, where `__package__` is empty; the old fallback import therefore raised `No module named 'gateway_client'`. No new version existed for `update-config` to reference, so the endpoint correctly remained on the last registered version. Keep all sibling modules in the `code_paths` directory and use the deterministic package bootstrap in `agent.py`; a `READY` endpoint alone does not prove that the new model was registered or that a request succeeded.
+The production endpoint was not updated because the publisher used a hand-written `POST /config` request, which is not the supported update API. A later model version also failed to load because MLflow loaded `agent.py` as a top-level code model while the sibling modules were under `/model/code`. Keep all sibling modules in `code_paths`, use the nested-path bootstrap in `agent.py`, and apply the generated body with `databricks serving-endpoints update-config`. A `READY` endpoint alone does not prove that the new model was registered or that a request succeeded.
 
 ### Safe promotion order
 
@@ -67,11 +108,21 @@ Run these stages in order and stop at the first failure:
 4. Only after the test endpoint is healthy, update the production endpoint with a complete `served_entities` and `traffic_config` body. Always pass `--profile DEFAULT`, preserve the current workload/scaling settings, and poll the endpoint again before declaring success.
 5. If any stage fails, collect the current `config_version`, served entity name, build logs, and runtime logs; do not guess a version or retry an endpoint update against an unregistered model.
 
-Never copy a PAT, provider API key, Claude/Codex credential, or old endpoint token into the model artifact, profile, endpoint environment, logs, or CI. The serving runtime uses managed Databricks authentication; endpoint configuration should contain only non-secret values such as `DATABRICKS_WORKSPACE_ID` or `DATABRICKS_AI_GATEWAY_BASE_URL`.
+Never copy a PAT, provider API key, Claude/Codex credential, or old endpoint token into the model artifact, profile, endpoint environment, logs, or CI. The serving runtime uses managed Databricks authentication; endpoint configuration should contain only non-secret values such as `DATABRICKS_HOST`, `DATABRICKS_WORKSPACE_ID`, or `DATABRICKS_AI_GATEWAY_BASE_URL`.
 
 ### Tracing beta gate
 
 Tracing is an operator-controlled feature, not a deployment-side switch. Before enabling it, confirm the workspace preview/beta flag, a Managed MLflow experiment with `CAN EDIT`, a SQL warehouse with `CAN USE`, the monitoring job permission, the endpoint identity, and the Unity Catalog trace catalog/schema privileges. The serving image uses `mlflow>=3.1.0,<4`; the separate UC trace-location/operator environment currently requires `mlflow[databricks]>=3.14.0`. `MLFLOW_TRACING_ENABLED`, `beta=true`, and `preview_or_beta=true` are only configuration markers. If any cloud prerequisite is unconfirmed, leave tracing disabled and report the exact missing gate rather than treating the template as enabled.
+
+The supported UC trace setup uses `from mlflow.entities.trace_location import UnityCatalog`,
+`mlflow.set_tracking_uri("databricks")`, and `trace_location=UnityCatalog(` with a
+`table_prefix=`. The runtime reads `MLFLOW_TRACING_SQL_WAREHOUSE_ID`; the resulting
+tables include `mlflow_experiment_trace_otel_annotations`, `_otel_logs`,
+`_otel_metrics`, and `_otel_spans`. The operator must have `USE_CATALOG`,
+`USE_SCHEMA`, and `MODIFY, SELECT`; `ALL_PRIVILEGES is not sufficient` for this
+contract. The workspace must be Unity Catalog-enabled and in a supported region,
+with `CAN USE` on the warehouse, `CAN EDIT` on the Managed MLflow experiment,
+and the monitoring job permission. `MLFLOW_TRACING_SQL_WAREHOUSE_ID alone is not a substitute` for those cloud gates.
 
 ## Operational runbook
 

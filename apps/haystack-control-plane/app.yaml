@@ -2,9 +2,12 @@ command:
   - npm
   - run
   - start
+resources:
+  - name: serving-endpoint
+    serving_endpoint:
+      name: haystack-agent-router
+      permission: CAN_QUERY
 env:
-  - name: PORT
-    value: "8000"
   - name: MODEL_SERVICE_PARENT
     value: "simo_prod.ai_models"
   - name: MODEL_SERVICE_PREFIX
@@ -13,3 +16,5 @@ env:
     value: "simo_prod.mysql_cdc_sync"
   - name: LAKEBASE_PROJECT
     value: "test_ontos"
+  - name: DATABRICKS_SERVING_ENDPOINT_NAME
+    valueFrom: serving-endpoint

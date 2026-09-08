@@ -66,6 +66,12 @@ function validateConfig(value) {
     throw new StoreError("CONFIG_INVALID", "agentGraph must be an object", 400);
   }
 
+  for (const key of ["mcpBindings", "skills", "prompts"]) {
+    if (!Array.isArray(next[key])) {
+      throw new StoreError("CONFIG_INVALID", `${key} must be an array`, 400);
+    }
+  }
+
   next.updatedAt = now();
   return next;
 }

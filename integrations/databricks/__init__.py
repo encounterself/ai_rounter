@@ -22,6 +22,7 @@ from .ai_gateway import (
 )
 from .gateway import (
     AnthropicBackend,
+    DatabricksFoundationModelBackend,
     DatabricksServingBackend,
     GatewayBackend,
     GatewayBackendError,
@@ -45,6 +46,7 @@ from .serving_endpoints import (
 
 __all__ = [
     "DatabricksServingEndpointsClient",
+    "DatabricksFoundationModelBackend",
     "DatabricksServingBackend",
     "DraftValidationResult",
     "FallbackPolicy",

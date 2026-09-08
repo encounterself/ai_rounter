@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createApiHandler } from "./api.mjs";
-import { DatabricksError } from "./databricks.mjs";
+import { DatabricksError, DatabricksClient } from "./databricks.mjs";
 import { loadConfig } from "./config.mjs";
 import { MemoryStore } from "./store.mjs";
 
@@ -74,4 +74,79 @@ test("draft, publish, and rollback use the server-side store", async () => {
   assert.equal(rolledBack.status, 200);
   assert.equal(rolledBack.body.draft.profileId, "demo");
   assert.equal(rolledBack.body.audit[0].action, "rollback");
+});
+
+test("serving endpoint resource is used without exposing credentials", async () => {
+  const requests = [];
+  const fetcher = async (url, options) => {
+    requests.push({ url, options });
+    return new Response(JSON.stringify({ id: "resp_1", output_text: "ok" }), { status: 200 });
+  };
+  const config = loadConfig({
+    DATABRICKS_HOST: "https://workspace.example",
+    DATABRICKS_SERVING_ENDPOINT_NAME: "bound-router",
+    DATABRICKS_TOKEN: "server-only-token",
+  });
+  const databricks = new DatabricksClient(config, fetcher);
+  const response = await databricks.gatewayRequest({
+    protocol: "agent/v1/responses",
+    route: "route_claude-sonnet-5",
+    input: [{ role: "user", content: "hello" }],
+    stream: false,
+  });
+
+  assert.equal(response.output_text, "ok");
+  assert.equal(requests[0].url, "https://workspace.example/serving-endpoints/bound-router/invocations");
+  assert.equal(requests[0].options.headers.Authorization, "Bearer server-only-token");
+  assert.deepEqual(JSON.parse(requests[0].options.body), {
+    model: "route_claude-sonnet-5",
+    input: [{ role: "user", content: "hello" }],
+    stream: false,
+  });
+});
+
+test("unsupported protocols fail before an upstream call", async () => {
+  const config = loadConfig({ DATABRICKS_HOST: "https://workspace.example", DATABRICKS_TOKEN: "server-only-token" });
+  const databricks = new DatabricksClient(config, async () => { throw new Error("upstream should not be called"); });
+  await assert.rejects(
+    databricks.gatewayRequest({ protocol: "unknown/v1/request", input: [{ role: "user", content: "hello" }] }),
+    (error) => error instanceof DatabricksError && error.code === "PROTOCOL_UNSUPPORTED",
+  );
+});
+
+test("API forwards request headers for App OBO authentication", async () => {
+  const calls = [];
+  const handler = makeHandler({
+    gatewayRequest: async (payload, headers) => { calls.push({ payload, headers }); return { output_text: "ok" }; },
+  });
+  const response = await handler({
+    method: "POST",
+    url: "/api/gateway/request",
+    headers: { "x-forwarded-access-token": "obo-token" },
+    body: JSON.stringify({ input: [{ role: "user", content: "hello" }] }),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(calls[0].headers["x-forwarded-access-token"], "obo-token");
+});
+
+test("API forwards orchestration draft as request metadata", async () => {
+  const calls = [];
+  const handler = makeHandler({
+    gatewayRequest: async (payload) => { calls.push(payload); return { output_text: "ok" }; },
+  });
+  const metadata = {
+    controlPlane: {
+      agentGraph: { nodes: [{ id: "start" }], edges: [] },
+      mcpBindings: [{ name: "search", transport: "http" }],
+      skills: [{ name: "summarize", enabled: true }],
+      prompts: [{ id: "system", template: "Be concise" }],
+    },
+  };
+  const response = await handler({
+    method: "POST",
+    url: "/api/gateway/request",
+    body: JSON.stringify({ input: [{ role: "user", content: "hello" }], metadata }),
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(calls[0].metadata, metadata);
 });

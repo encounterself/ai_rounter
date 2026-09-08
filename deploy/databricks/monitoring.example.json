@@ -5,7 +5,7 @@
   "minimum_operator_mlflow": ">=3.14.0",
   "operator_requirements": "mlflow[databricks]>=3.14.0",
   "serving_runtime_mlflow": ">=3.1.0,<4",
-  "requirements_boundary": "Serving image remains mlflow>=3.1.0,<4; UC ingestion runs in a separate operator environment pinned and validated at mlflow[databricks]>=3.14.0.",
+  "requirements_boundary": "serving image remains mlflow>=3.1.0,<4; UC ingestion runs in a separate operator environment pinned and validated at mlflow[databricks]>=3.14.0.",
   "trace_destination": "<uc-catalog>.<uc-schema>",
   "table_prefix": "<trace-table-prefix>",
   "sql_warehouse_id": "<sql-warehouse-id>",

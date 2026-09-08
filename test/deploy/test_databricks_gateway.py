@@ -4,6 +4,7 @@ import json
 import importlib.util
 import os
 import sys
+from collections.abc import Mapping
 from types import ModuleType, SimpleNamespace
 
 import httpx
@@ -19,6 +20,7 @@ from deploy.databricks.gateway_client import (
     GatewayResponseError,
     GatewaySettings,
     ManagedAuth,
+    ManagedAuthError,
     RouteValidationError,
 )
 from deploy.databricks.profile_loader import ProfileError, validate_profile
@@ -30,12 +32,14 @@ ROUTE = "model-services/simo_prod.ai_models.route_test"
 METADATA = {"provider": "test", "model": "test-model", "enabled": True}
 
 
-def test_gateway_settings_use_workspace_id_when_base_url_is_absent(monkeypatch):
+def test_gateway_settings_use_workspace_host_when_base_url_is_absent(monkeypatch):
     monkeypatch.delenv("DATABRICKS_AI_GATEWAY_BASE_URL", raising=False)
+    monkeypatch.setenv("DATABRICKS_HOST", "https://dbc-b21ff395-726b.cloud.databricks.com/")
     monkeypatch.setenv("DATABRICKS_WORKSPACE_ID", "3761760657895016")
     settings = GatewaySettings.from_env()
     assert settings.workspace_id == "3761760657895016"
-    assert settings.base_url == "https://3761760657895016.ai-gateway.cloud.databricks.com"
+    assert settings.base_url == "https://dbc-b21ff395-726b.cloud.databricks.com/ai-gateway/mlflow/v1"
+    assert settings.workspace_host == "https://dbc-b21ff395-726b.cloud.databricks.com"
 
 
 def test_gateway_settings_explicit_base_url_wins(monkeypatch):
@@ -47,13 +51,14 @@ def test_gateway_settings_explicit_base_url_wins(monkeypatch):
 
 def test_gateway_settings_require_base_url_or_workspace_id(monkeypatch):
     monkeypatch.delenv("DATABRICKS_AI_GATEWAY_BASE_URL", raising=False)
+    monkeypatch.delenv("DATABRICKS_HOST", raising=False)
     monkeypatch.delenv("DATABRICKS_WORKSPACE_ID", raising=False)
     with pytest.raises(ConfigurationError) as raised:
         GatewaySettings.from_env()
     assert raised.value.diagnostic["error_code"] == "missing_gateway_base_url"
     assert raised.value.diagnostic["missing"] == [
         "DATABRICKS_AI_GATEWAY_BASE_URL",
-        "DATABRICKS_WORKSPACE_ID",
+        "DATABRICKS_HOST",
     ]
 
 
@@ -85,6 +90,107 @@ def test_route_allowlist_and_metadata_are_enforced():
         allowed_routes=("approved",),
     )
     approved.validate_route("approved", METADATA)
+
+
+def test_system_ai_route_uses_workspace_serving_endpoint_without_model_service_gateway():
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]}, request=request)
+
+    settings = GatewaySettings(
+        workspace_id="workspace-id",
+        base_url="https://gateway.example/ai-gateway/mlflow/v1",
+        workspace_host="https://workspace.example",
+        route="system-ai/databricks-gpt-5-mini",
+        protocol="responses",
+    )
+    client = GatewayClient(
+        settings,
+        auth=ManagedAuth(lambda: {}),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    metadata = {
+        "backend": "databricks_serving",
+        "endpoint": "databricks-gpt-5-mini",
+        "protocol": "chat",
+        "model": "databricks-gpt-5-mini",
+    }
+
+    response = client.invoke(
+        {"input": [{"role": "user", "content": "hello"}]},
+        route="system-ai/databricks-gpt-5-mini",
+        metadata=metadata,
+    )
+
+    assert seen["url"] == "https://workspace.example/serving-endpoints/databricks-gpt-5-mini/invocations"
+    assert seen["body"] == {
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": False,
+    }
+    assert response["choices"][0]["message"]["content"] == "ok"
+
+
+def test_serving_endpoint_route_derives_endpoint_and_defaults_to_chat():
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]}, request=request)
+
+    settings = GatewaySettings(
+        workspace_id="workspace-id",
+        base_url="https://gateway.example/ai-gateway/mlflow/v1",
+        workspace_host="https://workspace.example",
+        route="serving-endpoints/databricks-kimi-k3",
+    )
+    client = GatewayClient(
+        settings,
+        auth=ManagedAuth(lambda: {}),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    response = client.invoke(
+        {"input": [{"role": "user", "content": "hello"}]},
+        route="serving-endpoints/databricks-kimi-k3",
+        metadata={},
+    )
+
+    assert seen["url"] == "https://workspace.example/serving-endpoints/databricks-kimi-k3/invocations"
+    assert seen["body"] == {
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": False,
+    }
+    assert response["choices"][0]["message"]["content"] == "ok"
+
+
+def test_system_ai_profile_metadata_requires_serving_endpoint_and_chat_protocol():
+    valid = {
+        "default_route": "system-ai/databricks-gpt-5-mini",
+        "route_metadata": {
+            "backend": "databricks_serving",
+            "endpoint": "databricks-gpt-5-mini",
+            "protocol": "chat",
+        },
+    }
+    validate_profile(valid)
+
+    invalid = {
+        **valid,
+        "route_metadata": {"backend": "databricks_serving", "protocol": "responses"},
+    }
+    with pytest.raises(ProfileError) as raised:
+        validate_profile(invalid)
+    assert raised.value.code == "serving_endpoint_invalid"
+
+    serving_route_profile = {
+        "default_route": "serving-endpoints/databricks-kimi-k3",
+        "route_metadata": {"endpoint": "databricks-kimi-k3", "protocol": "chat"},
+    }
+    validate_profile(serving_route_profile)
 
 
 @pytest.mark.parametrize("status", [401, 403, 404, 429, 500, 502, 503])
@@ -132,6 +238,124 @@ def test_managed_auth_failure_is_not_silent():
     assert "token" not in json.dumps(raised.value.diagnostic).lower()
 
 
+def test_managed_auth_uses_current_databricks_sdk_authenticate_contract(monkeypatch):
+    monkeypatch.delenv("IS_IN_DB_MODEL_SERVING_ENV", raising=False)
+    monkeypatch.delenv("IS_IN_DATABRICKS_MODEL_SERVING_ENV", raising=False)
+    calls = []
+
+    class Config:
+        def authenticate(self):
+            calls.append("authenticate")
+            return {"Authorization": "Bearer managed"}
+
+    class WorkspaceClient:
+        config = Config()
+
+        def __init__(self, **kwargs):
+            assert kwargs == {}
+
+    sdk_module = ModuleType("databricks.sdk")
+    sdk_module.WorkspaceClient = WorkspaceClient
+    credentials_module = ModuleType("databricks_ai_bridge")
+
+    class ModelServingUserCredentials:
+        pass
+
+    credentials_module.ModelServingUserCredentials = ModelServingUserCredentials
+    databricks_module = ModuleType("databricks")
+    databricks_module.sdk = sdk_module
+    monkeypatch.setitem(sys.modules, "databricks", databricks_module)
+    monkeypatch.setitem(sys.modules, "databricks.sdk", sdk_module)
+    monkeypatch.setitem(sys.modules, "databricks_ai_bridge", credentials_module)
+
+    assert ManagedAuth().headers() == {"Authorization": "Bearer managed"}
+    assert calls == ["authenticate"]
+
+
+def test_managed_auth_uses_model_serving_strategy(monkeypatch):
+    monkeypatch.setenv("IS_IN_DATABRICKS_MODEL_SERVING_ENV", "true")
+    calls = []
+
+    class Config:
+        def authenticate(self):
+            calls.append("authenticate")
+            return {"Authorization": "Bearer managed"}
+
+    class WorkspaceClient:
+        config = Config()
+
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+    sdk_module = ModuleType("databricks.sdk")
+    sdk_module.WorkspaceClient = WorkspaceClient
+    credentials_module = ModuleType("databricks_ai_bridge")
+
+    class ModelServingUserCredentials:
+        pass
+
+    credentials_module.ModelServingUserCredentials = ModelServingUserCredentials
+    databricks_module = ModuleType("databricks")
+    databricks_module.sdk = sdk_module
+    monkeypatch.setitem(sys.modules, "databricks", databricks_module)
+    monkeypatch.setitem(sys.modules, "databricks.sdk", sdk_module)
+    monkeypatch.setitem(sys.modules, "databricks_ai_bridge", credentials_module)
+
+    assert ManagedAuth().headers() == {"Authorization": "Bearer managed"}
+    assert calls[0].keys() == {"credentials_strategy"}
+    assert calls[0]["credentials_strategy"].__class__.__name__ == "ModelServingUserCredentials"
+    assert calls[1] == "authenticate"
+
+
+def test_managed_auth_prefers_serving_m2m_environment(monkeypatch):
+    monkeypatch.setenv("IS_IN_DB_MODEL_SERVING_ENV", "true")
+    monkeypatch.setenv("DATABRICKS_CLIENT_ID", "injected-client-id")
+    monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "injected-client-secret")
+    calls = []
+
+    class Config:
+        def authenticate(self):
+            calls.append("authenticate")
+            return {"Authorization": "Bearer managed"}
+
+    class WorkspaceClient:
+        config = Config()
+
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+    sdk_module = ModuleType("databricks.sdk")
+    sdk_module.WorkspaceClient = WorkspaceClient
+    databricks_module = ModuleType("databricks")
+    databricks_module.sdk = sdk_module
+    monkeypatch.setitem(sys.modules, "databricks", databricks_module)
+    monkeypatch.setitem(sys.modules, "databricks.sdk", sdk_module)
+
+    assert ManagedAuth().headers() == {"Authorization": "Bearer managed"}
+    assert calls == [{"auth_type": "oauth-m2m"}, "authenticate"]
+
+
+def test_managed_auth_initialization_failure_has_safe_stage(monkeypatch):
+    monkeypatch.setenv("IS_IN_DATABRICKS_MODEL_SERVING_ENV", "true")
+
+    class BrokenWorkspaceClient:
+        def __init__(self, **_kwargs):
+            raise RuntimeError("secret details")
+
+    sdk_module = ModuleType("databricks.sdk")
+    sdk_module.WorkspaceClient = BrokenWorkspaceClient
+    databricks_module = ModuleType("databricks")
+    databricks_module.sdk = sdk_module
+    monkeypatch.setitem(sys.modules, "databricks", databricks_module)
+    monkeypatch.setitem(sys.modules, "databricks.sdk", sdk_module)
+
+    with pytest.raises(ManagedAuthError) as raised:
+        ManagedAuth().headers()
+    assert raised.value.diagnostic["auth_stage"] == "initialization"
+    assert raised.value.diagnostic["auth_strategy"] == "obo"
+    assert "secret details" not in json.dumps(raised.value.diagnostic)
+
+
 def test_runtime_and_agent_copy_error_fields_without_prompt_or_secret(monkeypatch):
     monkeypatch.setenv("DATABRICKS_AI_GATEWAY_BASE_URL", "https://gateway.example")
     client = make_client(lambda request: httpx.Response(429, json={"error": {"code": "rate_limited"}}, request=request))
@@ -154,9 +378,11 @@ def test_runtime_and_agent_copy_error_fields_without_prompt_or_secret(monkeypatc
     })
     agent.runtime = runtime
     response = agent.predict({"input": [{"role": "user", "content": "secret prompt"}], "stream": False})
-    assert response["status"] == "failed"
-    assert response["error"]["error_code"] == "rate_limited"
-    assert "secret prompt" not in json.dumps(response)
+    response_data = response if isinstance(response, Mapping) else response.model_dump()
+    error = response_data.get("error") or response_data.get("custom_outputs", {}).get("error", {})
+    assert response_data["status"] == "failed"
+    assert error["error_code"] == "rate_limited"
+    assert "secret prompt" not in json.dumps(response_data)
 
 
 def test_responses_normalization_and_streaming_error():
@@ -198,9 +424,29 @@ def test_chat_gateway_explicitly_converts_responses_input():
         client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
     client.invoke({"input": [{"role": "user", "content": "Hello"}]}, metadata=METADATA)
-    assert seen["path"] == "/mlflow/v1/chat/completions"
+    assert seen["path"] == "/chat/completions"
+    assert seen["body"]["model"] == "simo_prod.ai_models.route_test"
     assert seen["body"]["messages"] == [{"role": "user", "content": "Hello"}]
     assert "input" not in seen["body"]
+
+
+def test_responses_gateway_sends_model_service_name_without_route_prefix():
+    seen = {}
+
+    def handler(request):
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"object": "response"}, request=request)
+
+    settings = GatewaySettings("workspace-id", "https://gateway.example/ai-gateway/mlflow/v1", ROUTE)
+    client = GatewayClient(
+        settings,
+        auth=ManagedAuth(lambda: {}),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    client.invoke({"input": [{"role": "user", "content": "Hello"}]}, metadata=METADATA)
+    assert seen["path"] == "/ai-gateway/mlflow/v1/responses"
+    assert seen["body"]["model"] == "simo_prod.ai_models.route_test"
 
 
 def test_agent_load_context_requires_profile_and_loads_artifact(monkeypatch, tmp_path):
@@ -226,8 +472,42 @@ def test_responses_request_object_is_supported():
         "input": [{"role": "user", "content": "Hello"}],
         "stream": False,
         "model": "route-model",
+        "metadata": {},
         "correlation_id": "corr-object",
         "request_id": None,
+    }
+
+
+def test_agent_uses_requested_route_metadata(monkeypatch):
+    monkeypatch.setenv("DATABRICKS_AI_GATEWAY_BASE_URL", "https://gateway.example")
+    profile = {
+        "default_route": ROUTE,
+        "route_metadata": METADATA,
+        "route_metadata_by_route": {
+            "model-services/simo_prod.ai_models.route_gpt-5-5": {"enabled": True, "provider": "openai"}
+        },
+        "gateway": {"base_url": "https://gateway.example"},
+    }
+    agent = Agent(profile)
+    seen = {}
+
+    def invoke(payload, **kwargs):
+        seen["route"] = payload["route"]
+        seen["metadata"] = payload["route_metadata"]
+        return {"output": []}
+
+    agent.runtime = SimpleNamespace(
+        _execute=invoke,
+        gateway=SimpleNamespace(settings=SimpleNamespace(protocol="responses", base_url="https://gateway.example")),
+    )
+    agent.predict({
+        "input": [{"role": "user", "content": "Hello"}],
+        "custom_inputs": {"model": "model-services/simo_prod.ai_models.route_gpt-5-5"},
+        "stream": False,
+    })
+    assert seen == {
+        "route": "model-services/simo_prod.ai_models.route_gpt-5-5",
+        "metadata": {"enabled": True, "provider": "openai"},
     }
 
 
@@ -271,8 +551,9 @@ def test_offline_stream_events_are_responses_events():
 
 def test_requirements_pin_managed_mlflow_and_agents():
     requirements = open("deploy/databricks/requirements.txt", encoding="utf-8").read()
-    assert "mlflow>=3.1.0,<4" in requirements
-    assert "databricks-agents>=1.2.0" in requirements
+    assert "mlflow>=3.16.0,<4" in requirements
+    assert "databricks-agents>=1.12.0" in requirements
+    assert "databricks-ai-bridge>=0.21.0" in requirements
 
 
 def test_recursive_trace_redaction_and_length_limit():
