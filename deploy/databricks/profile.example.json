@@ -1,0 +1,30 @@
+{
+  "default_route": "model-services/simo_prod.ai_models.route_claude-haiku-4-5",
+  "route_metadata": {
+    "provider": "anthropic-compatible",
+    "model": "claude-haiku-4-5",
+    "protocol": "chat",
+    "mcp_binding": "approved-mcp-binding",
+    "skill_binding": "approved-skill-binding",
+    "prompt_binding": "approved-prompt-binding"
+  },
+  "gateway": {
+    "workspace_id": null,
+    "protocol": "chat",
+    "allowed_routes": [],
+    "timeout_seconds": 60
+  },
+  "tracing": {
+    "enabled": false,
+    "experiment_name": null,
+    "sampling_ratio": 0.0,
+    "capture_content": false,
+    "beta": false,
+    "destination": null,
+    "sql_warehouse_id": null,
+    "uc_catalog": null,
+    "uc_schema": null,
+    "uc_table": null,
+    "uc_volume": null
+  }
+}

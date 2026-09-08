@@ -2,3 +2,14 @@ command:
   - npm
   - run
   - start
+env:
+  - name: PORT
+    value: "8000"
+  - name: MODEL_SERVICE_PARENT
+    value: "simo_prod.ai_models"
+  - name: MODEL_SERVICE_PREFIX
+    value: "route_"
+  - name: UC_READ_ONLY_SOURCE
+    value: "simo_prod.mysql_cdc_sync"
+  - name: LAKEBASE_PROJECT
+    value: "test_ontos"

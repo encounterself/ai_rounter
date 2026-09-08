@@ -15,9 +15,17 @@ import httpx
 MODEL_SERVICES_PATH = "/api/2.1/unity-catalog/model-services"
 DEFAULT_ALLOWED_RESOURCE_PREFIX = "model-services/simo_prod.ai_models.route_"
 DEFAULT_ALLOWED_MODEL_SERVICE_PREFIX = DEFAULT_ALLOWED_RESOURCE_PREFIX
+DEFAULT_ALLOWED_RESOURCE_PREFIXES = (
+    DEFAULT_ALLOWED_RESOURCE_PREFIX,
+    "model-services/simo_prod.ai_gateway.",
+)
+DEFAULT_ALLOWED_MODEL_SERVICE_PREFIXES = DEFAULT_ALLOWED_RESOURCE_PREFIXES
 DEFAULT_PARENT = "schemas/simo_prod.ai_models"
+DEFAULT_PARENTS = (DEFAULT_PARENT, "schemas/simo_prod.ai_gateway")
 DEFAULT_CACHE_TTL = timedelta(minutes=5)
 SYSTEM_AI_PREFIX = "system.ai."
+_RESOURCE_SUFFIX_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
+_SENSITIVE_METADATA_KEY_RE = re.compile(r"(?:api[_-]?key|authorization|password|secret|token)", re.IGNORECASE)
 
 
 class ModelServicesError(RuntimeError):
@@ -219,8 +227,8 @@ class DatabricksModelServiceRegistry:
         client: httpx.Client | None = None,
         http_client: httpx.Client | None = None,
         headers: Mapping[str, str] | None = None,
-        allowed_resource_prefix: str = DEFAULT_ALLOWED_RESOURCE_PREFIX,
-        parent: str = DEFAULT_PARENT,
+        allowed_resource_prefix: str | Sequence[str] = DEFAULT_ALLOWED_RESOURCE_PREFIXES,
+        parent: str | Sequence[str] = DEFAULT_PARENTS,
         cache_ttl: timedelta | float = DEFAULT_CACHE_TTL,
         page_size: int = 100,
         timeout: float | httpx.Timeout = 30.0,
@@ -250,8 +258,10 @@ class DatabricksModelServiceRegistry:
             default_headers.update(headers)
 
         self.base_url = resolved_base_url.rstrip("/")
-        self.allowed_resource_prefix = allowed_resource_prefix
-        self.parent = parent
+        self.allowed_resource_prefixes = _normalize_allowed_prefixes(allowed_resource_prefix)
+        self.allowed_resource_prefix = self.allowed_resource_prefixes[0]
+        self.parents = _normalize_parents(parent)
+        self.parent = self.parents[0]
         self.cache_ttl = resolved_cache_ttl
         self.page_size = page_size
         self._now = now or (lambda: datetime.now(timezone.utc))
@@ -296,52 +306,58 @@ class DatabricksModelServiceRegistry:
             request_headers["If-None-Match"] = current.etag
 
         raw_services: list[Mapping[str, Any]] = []
-        page_token: str | None = None
         response_etag: str | None = None
         response_expiry: datetime | None = None
         response_headers: Mapping[str, str] | None = None
-        first_page = True
+        for parent in self.parents:
+            page_token: str | None = None
+            first_page = True
+            while True:
+                params = {"parent": parent, "view": "FULL", "page_size": str(self.page_size)}
+                if page_token:
+                    params["page_token"] = page_token
+                response = self._client.get(
+                    MODEL_SERVICES_PATH,
+                    params=params,
+                    headers=request_headers if len(self.parents) == 1 and first_page else None,
+                )
 
-        while True:
-            params = {"parent": self.parent, "view": "FULL", "page_size": str(self.page_size)}
-            if page_token:
-                params["page_token"] = page_token
-            response = self._client.get(
-                MODEL_SERVICES_PATH, params=params, headers=request_headers if first_page else None
-            )
+                if first_page and response.status_code == httpx.codes.NOT_MODIFIED:
+                    if len(self.parents) != 1:
+                        raise ModelServicesPayloadError("Received HTTP 304 while discovering multiple parents.")
+                    if current is None:
+                        raise ModelServicesPayloadError("Received HTTP 304 without an existing snapshot.")
+                    renewed = self._renew_snapshot(current, now, response)
+                    self._snapshot = renewed
+                    return renewed
 
-            if first_page and response.status_code == httpx.codes.NOT_MODIFIED:
-                if current is None:
-                    raise ModelServicesPayloadError("Received HTTP 304 without an existing snapshot.")
-                renewed = self._renew_snapshot(current, now, response)
-                self._snapshot = renewed
-                return renewed
+                if response.status_code >= 400:
+                    raise ModelServicesHTTPError(response.status_code, str(response.url), response.text)
 
-            if response.status_code >= 400:
-                raise ModelServicesHTTPError(response.status_code, str(response.url), response.text)
+                response_headers = response_headers or response.headers
+                try:
+                    payload = response.json()
+                except ValueError as error:
+                    raise ModelServicesPayloadError("The Model Services API returned invalid JSON.") from error
 
-            response_headers = response_headers or response.headers
-            try:
-                payload = response.json()
-            except ValueError as error:
-                raise ModelServicesPayloadError("The Model Services API returned invalid JSON.") from error
+                raw_services.extend(_extract_service_items(payload))
+                response_etag = response_etag or response.headers.get("etag")
+                response_expiry = response_expiry or _extract_expiry(payload)
+                next_page_token = _extract_page_token(payload)
+                if not next_page_token:
+                    break
+                if next_page_token == page_token:
+                    raise ModelServicesPayloadError("The Model Services API returned a repeated page token.")
+                page_token = next_page_token
+                first_page = False
+                request_headers = {}
 
-            raw_services.extend(_extract_service_items(payload))
-            response_etag = response_etag or response.headers.get("etag")
-            response_expiry = response_expiry or _extract_expiry(payload)
-            page_token = _extract_page_token(payload)
-            if not page_token:
-                break
-            if not first_page and page_token == params.get("page_token"):
-                raise ModelServicesPayloadError("The Model Services API returned a repeated page token.")
-            first_page = False
-            request_headers = {}
-
-        services = tuple(
-            service
-            for raw_service in raw_services
-            if (service := _parse_model_service(raw_service)) is not None and self.is_user_selectable(service.name)
-        )
+        services_by_name: dict[str, ModelService] = {}
+        for raw_service in raw_services:
+            service = _parse_model_service(raw_service)
+            if service is not None and self.is_user_selectable(service.name):
+                services_by_name.setdefault(service.name, service)
+        services = tuple(services_by_name.values())
         header_expiry = _expiry_from_headers(response_headers or {}, now, self.cache_ttl)
         expires_at = _earliest_datetime([header_expiry, response_expiry, *(service.expires_at for service in services)])
         if expires_at is None:
@@ -382,10 +398,16 @@ class DatabricksModelServiceRegistry:
     def is_user_selectable(self, resource_name: str) -> bool:
         """Return whether a resource is visible and selectable by users."""
 
+        if not isinstance(resource_name, str):
+            return False
         normalized_name = resource_name.strip().lower()
         if not normalized_name or SYSTEM_AI_PREFIX in normalized_name:
             return False
-        return normalized_name.startswith(self.allowed_resource_prefix.lower())
+        return any(
+            normalized_name.startswith(prefix)
+            and bool(_RESOURCE_SUFFIX_RE.fullmatch(normalized_name[len(prefix) :]))
+            for prefix in self.allowed_resource_prefixes
+        )
 
     def _renew_snapshot(
         self, current: ModelServiceSnapshot, now: datetime, response: httpx.Response
@@ -585,7 +607,7 @@ def _parse_model_service(raw: Mapping[str, Any]) -> ModelService | None:
         rate_limits=tuple(_parse_rate_limit(item) for item in _as_sequence(rate_limits_raw)),
         etag=etag,
         expires_at=service_expiry,
-        metadata={key: value for key, value in payload.items() if key not in ignored_keys},
+        metadata=_safe_metadata({key: value for key, value in payload.items() if key not in ignored_keys}),
     )
 
 
@@ -600,7 +622,7 @@ def _parse_route(value: Any) -> ModelServiceRoute:
         traffic_percentage=_number(
             _first(payload, "traffic_percentage", "trafficPercentage", "traffic_percent", "weight")
         ),
-        metadata=dict(payload),
+        metadata=_safe_metadata(payload),
     )
 
 
@@ -615,8 +637,40 @@ def _parse_rate_limit(value: Any) -> ModelServiceRateLimit:
         renewal_period=_integer(_first(payload, "renewal_period", "renewalPeriod", "period", "window")),
         renewal_period_unit=_string(_first(payload, "renewal_period_unit", "renewalPeriodUnit", "period_unit", "unit")),
         principal=_string(_first(payload, "principal", "principal_type", "principalType")),
-        metadata=dict(payload),
+        metadata=_safe_metadata(payload),
     )
+
+
+def _normalize_allowed_prefixes(prefixes: str | Sequence[str]) -> tuple[str, ...]:
+    values = (prefixes,) if isinstance(prefixes, str) else tuple(prefixes)
+    normalized = tuple(value.strip().lower() for value in values if isinstance(value, str) and value.strip())
+    if not normalized:
+        raise ValueError("'allowed_resource_prefix' must contain at least one non-empty prefix.")
+    if any(value not in DEFAULT_ALLOWED_RESOURCE_PREFIXES for value in normalized):
+        raise ValueError("'allowed_resource_prefix' contains an unapproved model service prefix.")
+    return normalized
+
+
+def _normalize_parents(parents: str | Sequence[str]) -> tuple[str, ...]:
+    values = (parents,) if isinstance(parents, str) else tuple(parents)
+    normalized = tuple(value.strip() for value in values if isinstance(value, str) and value.strip())
+    if not normalized:
+        raise ValueError("'parent' must contain at least one non-empty schema parent.")
+    return normalized
+
+
+def _safe_metadata(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: _safe_metadata(child)
+            for key, child in value.items()
+            if not _SENSITIVE_METADATA_KEY_RE.search(str(key))
+        }
+    if isinstance(value, list):
+        return [_safe_metadata(child) for child in value]
+    if isinstance(value, tuple):
+        return tuple(_safe_metadata(child) for child in value)
+    return value
 
 
 def _expiry_from_headers(headers: Mapping[str, str], now: datetime, default_ttl: timedelta) -> datetime | None:

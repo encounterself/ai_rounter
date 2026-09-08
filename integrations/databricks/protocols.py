@@ -12,6 +12,24 @@ PROTOCOL_OPENAI_RESPONSES = "openai_responses"
 PROTOCOL_ANTHROPIC_MESSAGES = "anthropic_messages"
 PROTOCOL_CURSOR_CHAT = "cursor_chat"
 
+# Contract-facing names.  The older names above remain canonical for
+# backwards-compatible callers and endpoint paths.
+PROTOCOL_CHAT_COMPLETIONS = "chat_completions"
+PROTOCOL_RESPONSES = "responses"
+PROTOCOL_CURSOR_CHAT_COMPLETIONS = "cursor_chat_completions"
+
+
+@dataclass(frozen=True, slots=True)
+class ProtocolCapability:
+    """Provider-neutral capability metadata for one protocol."""
+
+    protocol: str
+    streaming: bool = True
+    tools: bool = True
+    claude: bool = False
+    codex_compatible: bool = False
+    provider_family: str = "generic"
+
 
 class ProtocolAdapterError(ValueError):
     """Base error raised by protocol adapters."""
@@ -738,12 +756,48 @@ _ADAPTERS: dict[str, ProtocolAdapter] = {
     PROTOCOL_CURSOR_CHAT: CursorChatAdapter(),
 }
 
+_PROTOCOL_ALIASES: dict[str, str] = {
+    PROTOCOL_CHAT_COMPLETIONS: PROTOCOL_MLFLOW_CHAT,
+    PROTOCOL_RESPONSES: PROTOCOL_OPENAI_RESPONSES,
+    PROTOCOL_CURSOR_CHAT_COMPLETIONS: PROTOCOL_CURSOR_CHAT,
+}
+
+_PROTOCOL_CAPABILITIES: dict[str, ProtocolCapability] = {
+    PROTOCOL_MLFLOW_CHAT: ProtocolCapability(PROTOCOL_MLFLOW_CHAT, provider_family="databricks"),
+    PROTOCOL_MLFLOW_RESPONSES: ProtocolCapability(PROTOCOL_MLFLOW_RESPONSES, provider_family="databricks"),
+    PROTOCOL_OPENAI_RESPONSES: ProtocolCapability(
+        PROTOCOL_OPENAI_RESPONSES, codex_compatible=True, provider_family="openai-compatible"
+    ),
+    PROTOCOL_ANTHROPIC_MESSAGES: ProtocolCapability(
+        PROTOCOL_ANTHROPIC_MESSAGES, claude=True, provider_family="anthropic"
+    ),
+    PROTOCOL_CURSOR_CHAT: ProtocolCapability(
+        PROTOCOL_CURSOR_CHAT, provider_family="cursor", codex_compatible=False
+    ),
+}
+
+
+def normalize_protocol(protocol: str) -> str:
+    """Return the canonical adapter name for a contract or legacy value."""
+
+    return _PROTOCOL_ALIASES.get(protocol, protocol)
+
 
 def get_protocol_adapter(protocol: str) -> ProtocolAdapter:
     """Return the local adapter registered for ``protocol``."""
 
     try:
-        return _ADAPTERS[protocol]
+        return _ADAPTERS[normalize_protocol(protocol)]
+    except KeyError as error:
+        raise UnsupportedProtocolError(f"Unsupported protocol: {protocol}") from error
+
+
+def get_protocol_capability(protocol: str) -> ProtocolCapability:
+    """Return capability metadata for a canonical or contract protocol name."""
+
+    canonical = normalize_protocol(protocol)
+    try:
+        return _PROTOCOL_CAPABILITIES[canonical]
     except KeyError as error:
         raise UnsupportedProtocolError(f"Unsupported protocol: {protocol}") from error
 
@@ -1118,15 +1172,21 @@ __all__ = [
     "MLflowResponsesAdapter",
     "OpenAIResponsesAdapter",
     "PROTOCOL_ANTHROPIC_MESSAGES",
+    "PROTOCOL_CHAT_COMPLETIONS",
     "PROTOCOL_CURSOR_CHAT",
+    "PROTOCOL_CURSOR_CHAT_COMPLETIONS",
     "PROTOCOL_MLFLOW_CHAT",
     "PROTOCOL_MLFLOW_RESPONSES",
     "PROTOCOL_OPENAI_RESPONSES",
+    "PROTOCOL_RESPONSES",
+    "ProtocolCapability",
     "ProtocolAdapter",
     "ProtocolAdapterError",
     "ProtocolPayloadError",
     "UnsupportedProtocolError",
     "get_protocol_adapter",
+    "get_protocol_capability",
+    "normalize_protocol",
     "parse_request",
     "parse_response",
     "parse_stream",

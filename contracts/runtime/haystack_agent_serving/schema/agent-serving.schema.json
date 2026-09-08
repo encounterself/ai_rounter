@@ -72,16 +72,19 @@
     },
     "logical_ref": {
       "type": "string",
-      "pattern": "^(?!agent_)(?!system\\.ai\\.)[a-z][a-z0-9._-]{0,127}$"
+      "pattern": "^(?!system(?:\\.|$))(?!agent_)(?![a-z][a-z0-9+.-]*://)(?!.*[/\\\\])[a-z][a-z0-9._-]{0,127}$"
     },
     "model_ref": {
       "type": "string",
-      "oneOf": [
+      "anyOf": [
+        {
+          "$ref": "#/$defs/logical_ref"
+        },
         {
           "pattern": "^model-services/simo_prod\\.ai_models\\.route_[a-z0-9][a-z0-9_-]{0,127}$"
         },
         {
-          "pattern": "^(?!agent_)(?!system\\.ai\\.)[a-z][a-z0-9._-]{0,127}$"
+          "pattern": "^model-services/simo_prod\\.ai_gateway\\.[a-z0-9][a-z0-9_-]{0,127}$"
         }
       ]
     },

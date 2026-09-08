@@ -25,7 +25,10 @@ from contracts.runtime.haystack_agent_serving.registries import (
 )
 
 _SCHEMA_PATH = Path(__file__).with_name("schema") / "agent-serving.schema.json"
-_MODEL_ROUTE_RE = re.compile(r"^model-services/simo_prod\.ai_models\.route_[a-z0-9][a-z0-9_-]{0,127}$")
+_MODEL_REF_PATTERNS = (
+    re.compile(r"^model-services/simo_prod\.ai_models\.route_[a-z0-9][a-z0-9_-]{0,127}$"),
+    re.compile(r"^model-services/simo_prod\.ai_gateway\.[a-z0-9][a-z0-9_-]{0,127}$"),
+)
 _LOGICAL_REF_RE = re.compile(r"^[a-z][a-z0-9._-]{0,127}$")
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9._-]{0,127}$")
 _FORBIDDEN_KEYS = {
@@ -39,7 +42,6 @@ _FORBIDDEN_KEYS = {
     "supervisor_agent",
 }
 _FORBIDDEN_RESOURCE_PREFIX = "agent_"
-_FORBIDDEN_SYSTEM_PREFIX = "system.ai."
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,10 +281,18 @@ class AgentServingSnapshotLoader:
         if not isinstance(raw, Mapping):
             return (ValidationIssue("$", "document must be an object"),)
 
-        schema_issues = [
-            ValidationIssue(_json_path(error.absolute_path), error.message)
-            for error in sorted(self._validator.iter_errors(raw), key=lambda item: list(item.absolute_path))
-        ]
+        schema_issues = []
+        for error in sorted(self._validator.iter_errors(raw), key=lambda item: list(item.absolute_path)):
+            path = _json_path(error.absolute_path)
+            if path.startswith("$/model_bindings/") and path.endswith("/ref"):
+                schema_issues.append(
+                    ValidationIssue(
+                        path,
+                        _model_ref_error(raw, error.absolute_path),
+                    )
+                )
+            else:
+                schema_issues.append(ValidationIssue(path, error.message))
         if schema_issues:
             return _dedupe_issues(schema_issues)
         return _dedupe_issues(_semantic_issues(raw))
@@ -445,8 +455,8 @@ def _forbidden_content_issues(value: Any, path: str = "$") -> list[ValidationIss
             issues.extend(_forbidden_content_issues(child, f"{path}/{index}"))
     elif isinstance(value, str):
         normalized = value.strip().lower()
-        if _FORBIDDEN_SYSTEM_PREFIX in normalized:
-            issues.append(ValidationIssue(path, "system.ai.* references are forbidden"))
+        if normalized.startswith("system.") or "system.ai." in normalized:
+            issues.append(ValidationIssue(path, "system.* references are forbidden; foundation models are not bindings"))
         if _FORBIDDEN_RESOURCE_PREFIX in normalized.split("/", maxsplit=1)[-1][: len(_FORBIDDEN_RESOURCE_PREFIX)]:
             issues.append(ValidationIssue(path, "resources with the agent_ prefix are forbidden"))
         if "supervisor agent" in normalized or normalized == "supervisor" or "supervisor_agent" in normalized:
@@ -454,6 +464,17 @@ def _forbidden_content_issues(value: Any, path: str = "$") -> list[ValidationIss
         if re.search(r"(?:^|[\s.:])import(?:\s|$)", normalized):
             issues.append(ValidationIssue(path, "arbitrary Python import expressions are forbidden"))
     return issues
+
+
+def _model_ref_error(raw: Mapping[str, Any], path: Sequence[Any]) -> str:
+    value: Any = raw
+    for part in path:
+        value = value[part]
+    if isinstance(value, str) and re.match(r"^system(?:\.|$)", value):
+        return "system.* foundation models cannot be declared as model bindings"
+    if isinstance(value, str) and any(pattern.fullmatch(value) for pattern in _MODEL_REF_PATTERNS):
+        return "model ref must be an approved model-services resource"
+    return "model ref must match an approved model-services resource prefix and complete resource name"
 
 
 def _require_ref(value: str | None, available: set[str], path: str, issues: list[ValidationIssue]) -> None:

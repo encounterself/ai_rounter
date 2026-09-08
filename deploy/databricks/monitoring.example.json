@@ -1,0 +1,59 @@
+{
+  "enabled": false,
+  "trace_enabled": false,
+  "preview_or_beta": true,
+  "minimum_operator_mlflow": ">=3.14.0",
+  "operator_requirements": "mlflow[databricks]>=3.14.0",
+  "serving_runtime_mlflow": ">=3.1.0,<4",
+  "requirements_boundary": "Serving image remains mlflow>=3.1.0,<4; UC ingestion runs in a separate operator environment pinned and validated at mlflow[databricks]>=3.14.0.",
+  "trace_destination": "<uc-catalog>.<uc-schema>",
+  "table_prefix": "<trace-table-prefix>",
+  "sql_warehouse_id": "<sql-warehouse-id>",
+  "cloud_confirmation_required": true,
+  "cloud_confirmations": {
+    "uc_enabled_workspace": false,
+    "supported_region": false,
+    "workspace_preview_or_beta_available": false,
+    "managed_mlflow_experiment_confirmed": false,
+    "managed_mlflow_experiment_can_edit_confirmed": false,
+    "sql_warehouse_can_use_confirmed": false,
+    "uc_permissions_confirmed": false,
+    "monitoring_job_permission_confirmed": false
+  },
+  "required_permissions": [
+    "USE_CATALOG",
+    "USE_SCHEMA",
+    "CAN EDIT on Managed MLflow experiment",
+    "monitoring job permission",
+    "MODIFY on each trace table",
+    "SELECT on each trace table"
+  ],
+  "tables": [
+    "<trace-table-prefix>_otel_annotations",
+    "<trace-table-prefix>_otel_logs",
+    "<trace-table-prefix>_otel_metrics",
+    "<trace-table-prefix>_otel_spans"
+  ],
+  "table_privileges": {
+    "<trace-table-prefix>_otel_annotations": ["MODIFY", "SELECT"],
+    "<trace-table-prefix>_otel_logs": ["MODIFY", "SELECT"],
+    "<trace-table-prefix>_otel_metrics": ["MODIFY", "SELECT"],
+    "<trace-table-prefix>_otel_spans": ["MODIFY", "SELECT"]
+  },
+  "mlflow": {
+    "experiment_name": "<managed-mlflow-experiment-name>",
+    "tracking_uri": "databricks"
+  },
+  "unity_catalog_trace_destination": {
+    "catalog": "<uc-catalog>",
+    "schema": "<uc-schema>",
+    "table_prefix": "<trace-table-prefix>"
+  },
+  "sampling_rate": 0.0,
+  "scorers": [
+    {
+      "name": "<registered-scorer-name>",
+      "sampling_rate": 0.0
+    }
+  ]
+}

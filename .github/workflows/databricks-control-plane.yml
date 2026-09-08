@@ -1,0 +1,95 @@
+name: Databricks control-plane CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "apps/haystack-control-plane/**"
+      - "contracts/runtime/haystack_agent_serving/**"
+      - "deploy/**"
+      - "integrations/databricks/**"
+      - "test/deploy/**"
+      - "test/integrations/databricks/**"
+      - ".github/workflows/databricks-control-plane.yml"
+      - "pyproject.toml"
+  push:
+    branches:
+      - main
+    paths:
+      - "apps/haystack-control-plane/**"
+      - "contracts/runtime/haystack_agent_serving/**"
+      - "deploy/**"
+      - "integrations/databricks/**"
+      - "test/deploy/**"
+      - "test/integrations/databricks/**"
+      - ".github/workflows/databricks-control-plane.yml"
+      - "pyproject.toml"
+
+permissions:
+  contents: read
+
+env:
+  HATCH_VERSION: "1.16.5"
+
+jobs:
+  python-contracts:
+    name: Python contracts and Databricks integrations
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.10"
+
+      - name: Install Hatch
+        run: pipx install hatch==${{ env.HATCH_VERSION }}
+
+      - name: Check formatting and linting
+        run: >-
+          hatch run fmt-check
+          deploy/databricks
+          integrations/databricks
+          contracts/runtime/haystack_agent_serving
+          test/deploy
+          test/integrations/databricks
+
+      - name: Run focused tests
+        run: >-
+          hatch run test:unit
+          test/deploy
+          test/integrations/databricks
+          contracts/runtime/haystack_agent_serving/tests/test_loader.py
+
+      - name: Run targeted static type checks
+        run: hatch run test:types
+
+  control-plane:
+    name: Databricks App control plane
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: apps/haystack-control-plane
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/haystack-control-plane/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run control-plane tests
+        run: npm test
+
+      - name: Build control plane
+        run: npm run build

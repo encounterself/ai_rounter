@@ -160,6 +160,48 @@ class SnapshotLoaderTests(unittest.TestCase):
         self.assertFalse(result.accepted)
         self.assertTrue(any("pattern" in issue.message or "valid under" in issue.message for issue in result.issues))
 
+    def test_accepts_gateway_model_services(self) -> None:
+        loader = AgentServingSnapshotLoader()
+        for reference in (
+            "model-services/simo_prod.ai_gateway.for_research_bedrock",
+            "model-services/simo_prod.ai_gateway.route_glm",
+        ):
+            profile = valid_profile()
+            profile["model_bindings"][0]["ref"] = reference
+            result = loader.load_mapping(profile)
+            self.assertTrue(result.accepted, result.issues)
+
+        profile = valid_profile()
+        profile["model_bindings"][0]["ref"] = "primary-alias"
+        result = loader.load_mapping(profile)
+        self.assertTrue(result.accepted, result.issues)
+
+    def test_rejects_unsafe_model_references(self) -> None:
+        loader = AgentServingSnapshotLoader()
+        references = (
+            "system.ai.gpt",
+            "system.foundation-model",
+            "system-alias",
+            "agent_alias",
+            "model-services/simo_prod.ai_models.route_",
+            "model-services/simo_prod.ai_other.route_test",
+            "model-services/other_prod.ai_models.route_test",
+            "https://workspace.example/model-services/simo_prod.ai_models.route_test",
+            "alias/name",
+            r"alias\name",
+            "alias/../name",
+            "python:os.system",
+            "import os",
+            "/absolute/model-services/simo_prod.ai_models.route_test",
+            "model-services/simo_prod.ai_gateway.evil/../../route_test",
+            "model-services/simo_prod.ai_models.agent_test",
+        )
+        for reference in references:
+            profile = valid_profile()
+            profile["model_bindings"][0]["ref"] = reference
+            result = loader.load_mapping(profile)
+            self.assertFalse(result.accepted, reference)
+
     def test_rejects_python_import_and_supervisor_agent(self) -> None:
         """Reject Supervisor Agent and arbitrary import configuration."""
 

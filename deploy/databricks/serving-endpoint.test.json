@@ -1,0 +1,36 @@
+{
+  "served_entities": [
+    {
+      "name": "<TEST_ENTITY_NAME>-<MODEL_VERSION>",
+      "entity_name": "<CATALOG>.<SCHEMA>.<REGISTERED_MODEL_NAME>",
+      "entity_version": "<MODEL_VERSION>",
+      "workload_size": "Small",
+      "scale_to_zero_enabled": true,
+      "environment_vars": {
+        "DATABRICKS_WORKSPACE_ID": "<WORKSPACE_ID>"
+      }
+    }
+  ],
+  "traffic_config": {
+    "routes": [
+      {
+        "served_model_name": "<TEST_ENTITY_NAME>-<MODEL_VERSION>",
+        "traffic_percentage": 100
+      }
+    ]
+  },
+  "tags": [
+    {
+      "key": "purpose",
+      "value": "independent-agent-test"
+    },
+    {
+      "key": "owner",
+      "value": "<TEAM_OR_OWNER>"
+    },
+    {
+      "key": "environment",
+      "value": "test"
+    }
+  ]
+}

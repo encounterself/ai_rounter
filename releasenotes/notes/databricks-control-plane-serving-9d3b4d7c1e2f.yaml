@@ -1,0 +1,10 @@
+---
+enhancements:
+  - |
+    Add a Databricks control-plane integration for AI Gateway route configuration,
+    multi-protocol serving, agent/MCP/skills/prompt release management, and a
+    reproducible MLflow 3 serving and tracing deployment contract.
+fixes:
+  - |
+    Make MLflow code-model sibling imports deterministic and document the safe
+    model-registration, validation, and Serving Endpoint promotion order.
