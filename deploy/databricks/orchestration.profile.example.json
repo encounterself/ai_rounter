@@ -11,7 +11,6 @@
     "nodes": [
       {"id": "request", "kind": "input"},
       {"id": "writing", "kind": "model", "model_binding": "writing", "skill_bindings": ["writing-style"], "prompt_bindings": ["writing-system"], "policy_route": "writing"},
-      {"id": "coding-coordinator", "kind": "model", "model_binding": "coding-coordinator", "skill_bindings": ["coding-standards"], "prompt_bindings": ["coding-coordinator-system"], "agent_tools": ["review-specialist", "coding-specialist"], "policy_route": "coding"},
       {"id": "review", "kind": "model", "model_binding": "coding-review", "skill_bindings": ["review-standards"], "prompt_bindings": ["review-system"]},
       {"id": "coding", "kind": "model", "model_binding": "coding-worker", "mcp_binding": "github-readonly", "skill_bindings": ["coding-standards"], "prompt_bindings": ["coding-system"]},
       {"id": "daily", "kind": "model", "model_binding": "daily", "prompt_bindings": ["daily-system"], "policy_route": "daily"},
@@ -19,32 +18,30 @@
     ],
     "edges": [
       {"source": "request", "target": "writing", "condition": "request.scenario == 'writing'"},
-      {"source": "request", "target": "coding-coordinator", "condition": "request.scenario == 'coding'"},
+      {"source": "request", "target": "review", "condition": "request.scenario == 'coding'"},
       {"source": "request", "target": "daily", "condition": "request.scenario == 'daily'"},
       {"source": "request", "target": "daily"},
       {"source": "writing", "target": "response"},
-      {"source": "coding-coordinator", "target": "response"},
+      {"source": "review", "target": "coding"},
+      {"source": "coding", "target": "response"},
       {"source": "daily", "target": "response"}
     ]
   },
-  "agent_tools": [
-    {"id": "review-specialist", "node": "review", "name": "review_code", "description": "Review the requested code and return actionable correctness, security, and maintainability findings.", "outputs_to_state": {"review_findings": {"source": "last_message", "handler": "message_text"}}},
-    {"id": "coding-specialist", "node": "coding", "name": "implement_code", "description": "Implement the requested change using the review findings and the coding specialist's approved tools.", "inputs_from_state": {"review_findings": "review_context"}}
-  ],
   "state_schema": {
-    "review_findings": {"type": "string", "handler": "replace", "persist": true}
+    "review_findings": {"type": "string", "handler": "replace", "persist": false}
   },
   "policy_router": {
     "default_action": "allow",
+    "router_model_binding": "router",
     "routes": [
       {"id": "writing", "priority": 10, "when": {"attribute": "request.scenario", "operator": "equals", "value": "writing"}, "action": "allow", "model_binding": "writing", "max_steps": 8},
-      {"id": "coding", "priority": 20, "when": {"attribute": "request.scenario", "operator": "equals", "value": "coding"}, "action": "allow", "model_binding": "coding-coordinator", "max_steps": 10},
+      {"id": "coding", "priority": 20, "when": {"attribute": "request.scenario", "operator": "equals", "value": "coding"}, "action": "allow", "model_binding": "coding-worker", "max_steps": 10},
       {"id": "daily", "priority": 30, "when": {"attribute": "request.scenario", "operator": "equals", "value": "daily"}, "action": "allow", "model_binding": "daily", "max_steps": 8}
     ]
   },
   "model_bindings": [
+    {"id": "router", "ref": "serving-endpoints/databricks-claude-haiku-4-5", "protocol": "chat_completions", "streaming": false, "tools": false},
     {"id": "writing", "ref": "serving-endpoints/databricks-claude-sonnet-5", "protocol": "chat_completions", "streaming": true, "tools": false},
-    {"id": "coding-coordinator", "ref": "serving-endpoints/databricks-claude-sonnet-5", "protocol": "chat_completions", "streaming": true, "tools": true},
     {"id": "coding-review", "ref": "serving-endpoints/databricks-claude-sonnet-5", "protocol": "chat_completions", "streaming": true, "tools": false},
     {"id": "coding-worker", "ref": "serving-endpoints/databricks-gpt-5-3-codex", "protocol": "responses", "streaming": true, "tools": true},
     {"id": "daily", "ref": "serving-endpoints/databricks-claude-haiku-4-5", "protocol": "chat_completions", "streaming": true, "tools": true}
@@ -73,17 +70,17 @@
     ]
   },
   "prompt_bindings": [
+    {"id": "routing-system", "role": "system", "ref": "routing-system", "allowed_variables": [], "user_override": false, "max_length": 4000},
     {"id": "writing-system", "role": "system", "ref": "writing-system", "allowed_variables": ["request.scenario"], "user_override": false, "max_length": 4000},
-    {"id": "coding-coordinator-system", "role": "system", "ref": "coding-coordinator-system", "allowed_variables": ["request.scenario"], "user_override": false, "max_length": 4000},
     {"id": "review-system", "role": "system", "ref": "review-system", "allowed_variables": ["request.scenario"], "user_override": false, "max_length": 4000},
-    {"id": "coding-system", "role": "system", "ref": "coding-system", "allowed_variables": ["request.scenario"], "user_override": false, "max_length": 4000},
+    {"id": "coding-system", "role": "system", "ref": "coding-system", "allowed_variables": ["request.scenario", "state.review_findings"], "user_override": false, "max_length": 4000},
     {"id": "daily-system", "role": "system", "ref": "daily-system", "allowed_variables": ["request.scenario"], "user_override": false, "max_length": 4000}
   ],
   "prompt_sources": {
+    "routing-system": "Classify the request into exactly one of daily, writing, or coding. Return JSON only with exactly this schema: {\"scenario\": \"daily|writing|coding\", \"confidence\": 0.0, \"reason\": \"short reason\"}. Do not use a different key such as classification.",
     "writing-system": "You are the writing agent. Follow the approved writing skill and produce clear, audience-aware drafts for {{request.scenario}}.",
-    "coding-coordinator-system": "You are the coding coordinator. Delegate review_code first, then implement_code with the review findings, and synthesize the final answer. Do not perform specialist work yourself.",
     "review-system": "You are the code review agent. Find correctness, security, and maintainability issues. Return actionable findings for the coding agent.",
-    "coding-system": "You are the coding agent. Apply the review findings, preserve constraints, and return a concrete implementation or patch.",
+    "coding-system": "You are the coding agent. Apply the review findings below, preserve constraints, and return a concrete implementation or patch.\n\nReview findings:\n{{state.review_findings}}",
     "daily-system": "You are the daily assistant. Be concise, useful, and explicit about uncertainty."
   },
   "skill_sources": {
@@ -98,7 +95,7 @@
     "mode": "databricks_ui",
     "trace_enabled": true,
     "sampling_ratio": 1.0,
-    "capture_content": false,
+    "capture_content": true,
     "redaction_policy": "strict",
     "metric_namespace": "haystack.agent",
     "emit_tool_events": true,
@@ -109,7 +106,7 @@
     "tracking_uri": "databricks",
     "experiment_id": "1575579281444652",
     "sampling_ratio": 1.0,
-    "capture_content": false,
+    "capture_content": true,
     "beta": true
   }
 }

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import httpx
@@ -366,6 +366,7 @@ class DatabricksChatGenerator:
         route_id: str | None = None,
         streaming_callback: StreamingCallbackT | None = None,
         generation_kwargs: dict[str, Any] | None = None,
+        trace_span_factory: Callable[[Mapping[str, Any]], Any] | None = None,
     ) -> None:
         self.runtime = runtime
         self.protocol = protocol
@@ -373,6 +374,7 @@ class DatabricksChatGenerator:
         self.route_id = route_id
         self.streaming_callback = streaming_callback
         self.generation_kwargs = generation_kwargs or {}
+        self.trace_span_factory = trace_span_factory
         self.last_metadata: dict[str, Any] = {}
 
     def to_dict(self) -> dict[str, Any]:
@@ -421,13 +423,28 @@ class DatabricksChatGenerator:
             "tool_names": [tool.name for tool in flatten_tools_or_toolsets(tools)] if tools else [],
         }
         if callback is None or tool_enabled:
-            result = self.runtime.handle_internal(canonical_protocol, payload, context=context)
+            call_span = self._start_trace_span(
+                metadata,
+                span_name=f"haystack.llm.{self.route_id or canonical_protocol}",
+                span_type="CHAT_MODEL",
+                payload=payload,
+            )
+            try:
+                result = self.runtime.handle_internal(canonical_protocol, payload, context=context)
+            except Exception as error:
+                if call_span is not None:
+                    call_span.finish(error={"exception_type": type(error).__name__, "error_code": "llm_call_error"})
+                raise
             metadata.update({"route": result.selection.primary.id, "route_attempts": result.attempts})
             self.last_metadata = metadata
             if result.response.error:
                 error = result.response.error
                 code = str(error.code) if error.code is not None else "upstream_error"
                 self.last_metadata["error_code"] = code
+                if call_span is not None:
+                    call_span.finish(
+                        error={"error_code": code, "error_type": error.type, "route_attempts": list(result.attempts)}
+                    )
                 raise DatabricksChatGeneratorError(
                     error.message,
                     code=code,
@@ -438,17 +455,72 @@ class DatabricksChatGenerator:
                         "route_attempts": list(result.attempts),
                     },
                 )
+            if call_span is not None:
+                call_span.finish(
+                    attributes={
+                        "status": "completed",
+                        "route": result.selection.primary.id,
+                        "route_attempts": list(result.attempts),
+                        "model": result.response.model,
+                        "finish_reason": result.response.finish_reason,
+                        "usage": (
+                            {
+                                "input_tokens": result.response.usage.input_tokens,
+                                "output_tokens": result.response.usage.output_tokens,
+                                "total_tokens": result.response.usage.total_tokens,
+                            }
+                            if result.response.usage
+                            else {}
+                        ),
+                    }
+                )
             return {"replies": [_response_message(result.response, metadata)], "meta": metadata}
 
         chunks: list[StreamingChunk] = []
         component_info = ComponentInfo.from_component(self)
-        for rendered in self.runtime.stream(canonical_protocol, payload, context=context):
-            event = parse_stream(canonical_protocol, rendered)
-            chunk = _streaming_chunk(event, component_info)
-            chunks.append(chunk)
-            callback(chunk)
+        call_span = self._start_trace_span(
+            metadata,
+            span_name=f"haystack.llm.{self.route_id or canonical_protocol}",
+            span_type="CHAT_MODEL",
+            payload=payload,
+        )
+        try:
+            for rendered in self.runtime.stream(canonical_protocol, payload, context=context):
+                event = parse_stream(canonical_protocol, rendered)
+                chunk = _streaming_chunk(event, component_info)
+                chunks.append(chunk)
+                callback(chunk)
+        except Exception as error:
+            if call_span is not None:
+                call_span.finish(error={"exception_type": type(error).__name__, "error_code": "llm_stream_error"})
+            raise
+        if call_span is not None:
+            call_span.finish(attributes={"status": "completed", "route": self.route_id, "streamed_chunks": len(chunks)})
         self.last_metadata = metadata
         return {"replies": [_convert_streaming_chunks_to_chat_message(chunks=chunks)], "meta": metadata}
+
+    def _start_trace_span(
+        self, metadata: Mapping[str, Any], *, span_name: str, span_type: str, payload: Mapping[str, Any] | None = None
+    ) -> Any:
+        if self.trace_span_factory is None:
+            return None
+        span_metadata = {
+            **dict(metadata),
+            "model": self.model or self.route_id,
+            "model_binding": self.route_id,
+            "model_target": self.route_id,
+            "route": self.route_id,
+            "protocol": self.protocol,
+            "provider": "databricks-serving",
+            "provider_kind": "databricks_serving",
+            "span_name": span_name,
+            "span_type": span_type,
+            "payload": payload,
+        }
+        span = self.trace_span_factory(span_metadata)
+        if span is not None:
+            span.__enter__()
+        return span
 
     @component.output_types(replies=list[ChatMessage], meta=dict[str, Any])
     async def run_async(

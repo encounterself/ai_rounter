@@ -81,7 +81,10 @@ class ConfiguredAgentOrchestrator:
     ) -> OrchestrationResult:
         """Run the selected Haystack Agent nodes in graph order."""
 
-        request = dict(request or {})
+        request = request if isinstance(request, dict) else dict(request or {})
+        routing = self._resolve_scenario(messages, request, trace_span_factory=trace_span_factory)
+        request["scenario"] = routing["scenario"]
+        request["routing"] = routing
         policy = self._select_policy(request)
         if policy.action != "allow":
             raise AgentOrchestrationError(f"request blocked by policy: {policy.action}")
@@ -89,6 +92,8 @@ class ConfiguredAgentOrchestrator:
         current_messages = list(messages)
         session_state = _copy_state(state)
         node_results: list[dict[str, Any]] = []
+        if self.snapshot.policy_router.router_model_binding:
+            node_results.append(_routing_trace_node(routing))
         graph_nodes = {node.id: node for node in self.snapshot.agent_graph.nodes}
         current_node_id = self.snapshot.agent_graph.entry_node
         graph_path: list[str] = []
@@ -129,6 +134,8 @@ class ConfiguredAgentOrchestrator:
                     session_state["exit_reason"] = node_result.get("exit_reason")
                     for key, value in node_result.get("state_updates", {}).items():
                         session_state[key] = value
+                    if node.id == "review" and current_messages:
+                        session_state["review_findings"] = _message_text(current_messages[-1])
             elif node.kind in {"input", "output", "router"}:
                 pass
             else:
@@ -159,8 +166,11 @@ class ConfiguredAgentOrchestrator:
                 "profile_version": self.snapshot.profile.version,
                 "policy_route": policy.id,
                 "scenario": request.get("scenario"),
+                "routing": routing,
                 "nodes": node_results,
                 "graph_path": graph_path,
+                "execution_path": (["smart-router"] if self.snapshot.policy_router.router_model_binding else [])
+                + graph_path,
                 "terminal_node": graph_path[-1],
             },
             state={
@@ -193,17 +203,14 @@ class ConfiguredAgentOrchestrator:
         binding = self.snapshot.model_bindings.get(binding_id)
         if binding is None:
             raise AgentOrchestrationError(f"unknown model binding: {binding_id}")
-        generator = self._generator(binding_id, binding.protocol)
+        generator = self._generator(binding_id, binding.protocol, trace_span_factory=trace_span_factory)
         mcp_binding_id = policy.mcp_binding or node.mcp_binding
-        tools = self._tools_for_node(node, mcp_binding_id=mcp_binding_id)
+        tools = self._tools_for_node(node, mcp_binding_id=mcp_binding_id, trace_span_factory=trace_span_factory)
         delegated_tools = self._agent_tools_for_node(
-            node,
-            request,
-            trace_span_factory=trace_span_factory,
-            building=frozenset(),
+            node, request, trace_span_factory=trace_span_factory, building=frozenset()
         )
         tools = _combine_tools(tools, delegated_tools)
-        prompt = self._prompt_for_node(node, request)
+        prompt = self._prompt_for_node(node, request, state=state)
         if delegated_tools:
             delegate_names = ", ".join(tool.name for tool in delegated_tools)
             prompt = (prompt + "\n\n" if prompt else "") + (
@@ -235,9 +242,7 @@ class ConfiguredAgentOrchestrator:
         if node_span is not None:
             node_span.__enter__()
         try:
-            state_kwargs = {
-                key: state[key] for key in self.snapshot.state_schema if key in state and key != "messages"
-            }
+            state_kwargs = {key: state[key] for key in self.snapshot.state_schema if key in state and key != "messages"}
             result = agent.run(
                 messages=messages,
                 streaming_callback=streaming_callback,
@@ -305,16 +310,17 @@ class ConfiguredAgentOrchestrator:
             delegate_binding = self.snapshot.model_bindings.get(delegate_binding_id)
             if delegate_binding is None:
                 raise AgentOrchestrationError(f"unknown delegated model binding: {delegate_binding_id}")
-            delegate_generator = self._generator(delegate_binding_id, delegate_binding.protocol)
-            delegate_mcp = self._tools_for_node(delegate_node, mcp_binding_id=delegate_node.mcp_binding)
+            delegate_generator = self._generator(
+                delegate_binding_id, delegate_binding.protocol, trace_span_factory=trace_span_factory
+            )
+            delegate_mcp = self._tools_for_node(
+                delegate_node, mcp_binding_id=delegate_node.mcp_binding, trace_span_factory=trace_span_factory
+            )
             nested = self._agent_tools_for_node(
-                delegate_node,
-                request,
-                trace_span_factory=trace_span_factory,
-                building=building | {binding_id},
+                delegate_node, request, trace_span_factory=trace_span_factory, building=building | {binding_id}
             )
             delegate_tools = _combine_tools(delegate_mcp, nested)
-            delegate_prompt = self._prompt_for_node(delegate_node, request)
+            delegate_prompt = self._prompt_for_node(delegate_node, request, state=request)
             input_names = tuple(dict.fromkeys(binding.inputs_from_state.values()))
             delegate_user_prompt = self._state_input_prompt(input_names)
             delegate_agent = HaystackAgent(
@@ -361,9 +367,7 @@ class ConfiguredAgentOrchestrator:
 
     def _haystack_state_schema(self, *, exclude: set[str] | None = None) -> dict[str, dict[str, Any]]:
         excluded = exclude or set()
-        schema: dict[str, dict[str, Any]] = {
-            "orchestration_context": {"type": dict},
-        }
+        schema: dict[str, dict[str, Any]] = {"orchestration_context": {"type": dict}}
         for key, definition in self.snapshot.state_schema.items():
             if key in excluded:
                 continue
@@ -376,7 +380,14 @@ class ConfiguredAgentOrchestrator:
             schema[key] = item
         return schema
 
-    def _generator(self, binding_id: str, protocol: str) -> DatabricksChatGenerator:
+    def _generator(
+        self, binding_id: str, protocol: str, *, trace_span_factory: Callable[[Mapping[str, Any]], Any] | None = None
+    ) -> DatabricksChatGenerator:
+        if trace_span_factory is not None:
+            route_id = self._route_id_for_binding(binding_id)
+            return DatabricksChatGenerator(
+                self.runtime, protocol=protocol, route_id=route_id, trace_span_factory=trace_span_factory
+            )
         if binding_id not in self._generators:
             route_id = self._route_id_for_binding(binding_id)
             self._generators[binding_id] = DatabricksChatGenerator(self.runtime, protocol=protocol, route_id=route_id)
@@ -421,9 +432,151 @@ class ConfiguredAgentOrchestrator:
             id="implicit-default", priority=2**31 - 1, when={}, action=self.snapshot.policy_router.default_action
         )
 
-    def _prompt_for_node(self, node: GraphNode, request: Mapping[str, Any]) -> str | None:
+    def _resolve_scenario(
+        self,
+        messages: Sequence[ChatMessage],
+        request: dict[str, Any],
+        *,
+        trace_span_factory: Callable[[Mapping[str, Any]], Any] | None,
+    ) -> dict[str, Any]:
+        """Resolve an explicit scenario or classify the request with a router model."""
+
+        allowed = tuple(route.id for route in self.snapshot.policy_router.routes)
+        explicit = request.get("scenario")
+        if isinstance(explicit, str) and explicit in allowed:
+            return {
+                "mode": "explicit",
+                "scenario": explicit,
+                "router_model": "none",
+                "model_target": "none",
+                "route": "none",
+                "protocol": "none",
+                "provider": "none",
+                "provider_kind": "none",
+                "route_attempts": [],
+                "confidence": 1.0,
+                "reason": "scenario supplied by caller",
+                "fallback": False,
+            }
+
+        binding_id = self.snapshot.policy_router.router_model_binding
+        if binding_id is None:
+            scenario, confidence, reason = _heuristic_scenario(messages, allowed)
+            return {
+                "mode": "heuristic",
+                "scenario": scenario,
+                "router_model": "none",
+                "model_target": "none",
+                "route": "none",
+                "protocol": "none",
+                "provider": "none",
+                "provider_kind": "none",
+                "route_attempts": [],
+                "confidence": confidence,
+                "reason": reason,
+                "fallback": True,
+            }
+
+        binding = self.snapshot.model_bindings.get(binding_id)
+        if binding is None:
+            raise AgentOrchestrationError(f"unknown router model binding: {binding_id}")
+
+        provider_metadata = self._provider_metadata(self._route_id_for_binding(binding_id), binding.ref)
+        trace_metadata = {
+            "node_id": "smart-router",
+            "model": binding_id,
+            "model_binding": binding_id,
+            "model_target": binding.ref,
+            "route": self._route_id_for_binding(binding_id),
+            "protocol": binding.protocol,
+            **provider_metadata,
+            "mcp_binding": "none",
+            "skill_bindings": [],
+            "prompt_binding_ids": ["routing-system"],
+            "tool_count": 0,
+            "tool_names": [],
+        }
+        router_span = trace_span_factory(trace_metadata) if trace_span_factory else None
+        if router_span is not None:
+            router_span.__enter__()
+        try:
+            generator = self._generator(binding_id, binding.protocol, trace_span_factory=trace_span_factory)
+            result = generator.run(
+                messages=[
+                    ChatMessage.from_system(
+                        self.prompt_sources.get("routing-system")
+                        or (
+                            "Classify the user's request into exactly one allowed scenario. "
+                            f"Allowed scenarios: {', '.join(allowed)}. "
+                            'Return only JSON: {"scenario":"...","confidence":0.0,"reason":"..."}.'
+                        )
+                    ),
+                    ChatMessage.from_user(_routing_input(messages)),
+                ],
+                generation_kwargs={"temperature": 0, "max_tokens": 160},
+            )
+            text = _reply_text(result)
+            parsed = _parse_routing_result(text, allowed)
+            if parsed is None:
+                scenario, confidence, reason = _heuristic_scenario(messages, allowed)
+                parsed = {
+                    "scenario": scenario,
+                    "confidence": confidence,
+                    "reason": f"router output was invalid: {reason}",
+                    "fallback": True,
+                }
+            else:
+                parsed["fallback"] = False
+            parsed.update(
+                {
+                    "mode": "llm",
+                    "router_model": binding_id,
+                    "model_target": binding.ref,
+                    "route": self._route_id_for_binding(binding_id),
+                    "protocol": binding.protocol,
+                    **provider_metadata,
+                    "route_attempts": getattr(generator, "last_metadata", {}).get("route_attempts", []),
+                    "router_output": text[:512],
+                }
+            )
+            if router_span is not None:
+                router_span.finish(
+                    attributes={
+                        "status": "completed",
+                        "selected_scenario": parsed["scenario"],
+                        "routing_mode": parsed["mode"],
+                        "routing_confidence": parsed["confidence"],
+                        "routing_reason": parsed["reason"],
+                        "fallback": parsed["fallback"],
+                        "route_attempts": getattr(generator, "last_metadata", {}).get("route_attempts", []),
+                    }
+                )
+            return parsed
+        except Exception as error:
+            if router_span is not None:
+                router_span.finish(error={"exception_type": type(error).__name__, "error_code": "router_error"})
+            scenario, confidence, reason = _heuristic_scenario(messages, allowed)
+            return {
+                "mode": "fallback",
+                "scenario": scenario,
+                "router_model": binding_id,
+                "model_target": binding.ref,
+                "route": self._route_id_for_binding(binding_id),
+                "protocol": binding.protocol,
+                **provider_metadata,
+                "route_attempts": [],
+                "confidence": confidence,
+                "reason": f"router failed: {type(error).__name__}; {reason}",
+                "fallback": True,
+            }
+
+    def _prompt_for_node(
+        self, node: GraphNode, request: Mapping[str, Any], *, state: Mapping[str, Any] | None = None
+    ) -> str | None:
         sections: list[str] = []
         variables = {f"request.{key}": str(value) for key, value in request.items() if value is not None}
+        if isinstance(state, Mapping):
+            variables.update({f"state.{key}": str(value) for key, value in state.items() if value is not None})
         for binding_id in node.prompt_bindings:
             binding = self.snapshot.prompt_bindings[binding_id]
             template = self.prompt_sources.get(binding_id) or self.prompt_sources.get(binding.ref)
@@ -442,7 +595,13 @@ class ConfiguredAgentOrchestrator:
             sections.append(f"# Skill: {skill.id}\n{body}")
         return "\n\n".join(sections) or None
 
-    def _tools_for_node(self, node: GraphNode, *, mcp_binding_id: str | None = None) -> ToolsType | None:
+    def _tools_for_node(
+        self,
+        node: GraphNode,
+        *,
+        mcp_binding_id: str | None = None,
+        trace_span_factory: Callable[[Mapping[str, Any]], Any] | None = None,
+    ) -> ToolsType | None:
         selected_binding = mcp_binding_id or node.mcp_binding
         if not selected_binding:
             return None
@@ -456,9 +615,11 @@ class ConfiguredAgentOrchestrator:
         allowed = set(binding.tools) or set(server.allowed_tools)
         if isinstance(configured, Toolset):
             configured.warm_up()
-            return [tool for tool in configured if tool.name in allowed]
+            tools = [tool for tool in configured if tool.name in allowed]
+            return _trace_tools(tools, trace_span_factory)
         if isinstance(configured, list):
-            return [tool for tool in configured if isinstance(tool, Tool) and tool.name in allowed]
+            tools = [tool for tool in configured if isinstance(tool, Tool) and tool.name in allowed]
+            return _trace_tools(tools, trace_span_factory)
         return configured
 
     @staticmethod
@@ -537,11 +698,117 @@ def _parse_condition_literal(value: str) -> Any:
     try:
         return ast.literal_eval(value)
     except (SyntaxError, ValueError):
-        return value.strip('"\'')
+        return value.strip("\"'")
 
 
 def _copy_state(value: Mapping[str, Any] | None) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _routing_input(messages: Sequence[ChatMessage]) -> str:
+    """Render bounded conversation context for the semantic router."""
+
+    parts: list[str] = []
+    for message in messages[-8:]:
+        role = getattr(message, "role", "user")
+        text = getattr(message, "text", None) or ""
+        if not text:
+            text = str(getattr(message, "content", ""))
+        parts.append(f"{role}: {text[:2000]}")
+    return "\n".join(parts) or "user: "
+
+
+def _reply_text(result: Mapping[str, Any]) -> str:
+    replies = result.get("replies", [])
+    if not isinstance(replies, Sequence) or not replies:
+        return ""
+    reply = replies[0]
+    return str(getattr(reply, "text", None) or getattr(reply, "content", None) or "")
+
+
+def _message_text(message: ChatMessage) -> str:
+    text = getattr(message, "text", None)
+    if text:
+        return str(text)
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        return content
+    return str(content or "")
+
+
+def _parse_routing_result(text: str, allowed: Sequence[str]) -> dict[str, Any] | None:
+    decoder = json.JSONDecoder()
+    payloads: list[Mapping[str, Any]] = []
+    for match in re.finditer(r"\{", text):
+        try:
+            payload, _ = decoder.raw_decode(text[match.start() :])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, Mapping):
+            payloads.append(payload)
+    for payload in payloads:
+        raw_scenario = payload.get("scenario") or payload.get("classification") or payload.get("route")
+        scenario = str(raw_scenario).strip().lower() if raw_scenario is not None else ""
+        allowed_scenarios = {str(item).lower(): item for item in allowed}
+        if scenario in allowed_scenarios:
+            try:
+                confidence = min(1.0, max(0.0, float(payload.get("confidence", 0.5))))
+            except (TypeError, ValueError):
+                confidence = 0.5
+            return {
+                "scenario": allowed_scenarios[scenario],
+                "confidence": confidence,
+                "reason": str(payload.get("reason") or payload.get("rationale") or "router classification")[:512],
+            }
+    normalized = text.strip().strip("` ").lower()
+    for scenario in allowed:
+        if normalized == scenario.lower():
+            return {"scenario": scenario, "confidence": 0.5, "reason": "router returned a bare scenario"}
+    return None
+
+
+def _heuristic_scenario(messages: Sequence[ChatMessage], allowed: Sequence[str]) -> tuple[str, float, str]:
+    """Provide a deterministic fallback when the semantic router is unavailable."""
+
+    text = _routing_input(messages).lower()
+    coding_terms = ("code", "coding", "bug", "debug", "implement", "review", "python", "代码", "编程", "调试")
+    writing_terms = ("write", "writing", "draft", "rewrite", "文案", "写作", "改写", "润色", "文章")
+    if "coding" in allowed and any(term in text for term in coding_terms):
+        return "coding", 0.72, "matched coding intent in router fallback"
+    if "writing" in allowed and any(term in text for term in writing_terms):
+        return "writing", 0.72, "matched writing intent in router fallback"
+    if "daily" in allowed:
+        return "daily", 0.35, "no high-confidence route match; using daily fallback"
+    return (allowed[0] if allowed else "daily"), 0.1, "no configured route was available"
+
+
+def _routing_trace_node(routing: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose the semantic routing decision as the first orchestration node."""
+
+    return {
+        "node_id": "smart-router",
+        "model": routing.get("router_model", "none"),
+        "model_binding": routing.get("router_model", "none"),
+        "model_target": routing.get("model_target", "none"),
+        "route": routing.get("route", "none"),
+        "protocol": routing.get("protocol", "none"),
+        "provider": routing.get("provider", "none"),
+        "provider_kind": routing.get("provider_kind", "none"),
+        "mcp_binding": "none",
+        "skill_bindings": [],
+        "prompt_binding_ids": ["routing-system"],
+        "tool_count": 0,
+        "tool_names": [],
+        "step_count": 1,
+        "token_usage": {},
+        "tool_call_counts": {},
+        "exit_reason": "routing",
+        "route_attempts": list(routing.get("route_attempts", [])),
+        "routing_mode": routing.get("mode", "unknown"),
+        "selected_scenario": routing.get("scenario", "unknown"),
+        "routing_confidence": routing.get("confidence", 0.0),
+        "routing_reason": routing.get("reason", "not supplied"),
+    }
 
 
 def _state_output_handler(name: str) -> Callable[[Any, Any], Any]:
@@ -580,6 +847,53 @@ def _combine_tools(primary: ToolsType | None, delegated: Sequence[Tool]) -> Tool
     primary_tools = ConfiguredAgentOrchestrator._tool_list(primary)
     combined = [*primary_tools, *delegated]
     return combined or None
+
+
+def _trace_tools(tools: Sequence[Tool], trace_span_factory: Callable[[Mapping[str, Any]], Any] | None) -> list[Tool]:
+    """Wrap MCP tools with bounded, request-scoped tool spans."""
+
+    if trace_span_factory is None:
+        return list(tools)
+    wrapped: list[Tool] = []
+    for tool in tools:
+        if tool.function is None:
+            wrapped.append(tool)
+            continue
+
+        def invoke(*, _tool: Tool = tool, **arguments: Any) -> Any:
+            span = trace_span_factory(
+                {
+                    "span_name": f"haystack.tool.{_tool.name}",
+                    "span_type": "TOOL",
+                    "tool_name": _tool.name,
+                    "tool_count": 1,
+                    "payload": {"arguments": arguments},
+                }
+            )
+            if span is not None:
+                span.__enter__()
+            try:
+                result = _tool.invoke(**arguments)
+            except Exception as error:
+                if span is not None:
+                    span.finish(error={"exception_type": type(error).__name__, "error_code": "tool_call_error"})
+                raise
+            if span is not None:
+                span.finish(attributes={"status": "completed", "result_type": type(result).__name__})
+            return result
+
+        wrapped.append(
+            Tool(
+                name=tool.name,
+                description=tool.description,
+                parameters=tool.tool_spec.get("parameters", {}),
+                function=invoke,
+                outputs_to_string=tool.outputs_to_string,
+                inputs_from_state=tool.inputs_from_state,
+                outputs_to_state=tool.outputs_to_state,
+            )
+        )
+    return wrapped
 
 
 def _state_type(value: Any) -> type:

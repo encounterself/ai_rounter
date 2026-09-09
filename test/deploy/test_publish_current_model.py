@@ -9,6 +9,7 @@ from deploy.databricks.publish_current_model import (
     lakebase_resource_name,
     obo_auth_policy,
     profile_secret_refs,
+    profile_serving_endpoint_names,
     profile_tracing_environment,
     register_model,
     update_endpoint_with_cli,
@@ -52,6 +53,43 @@ def test_register_model_returns_this_registration_version_not_latest(monkeypatch
     assert version == "23"
 
 
+def test_register_model_uses_profile_experiment_id(monkeypatch, tmp_path: Path):
+    class Run:
+        info = SimpleNamespace(run_id="run-123")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    model_info = SimpleNamespace(registered_model_version="24")
+    set_experiment_calls: list[dict[str, str]] = []
+    (tmp_path / "profile.json").write_text(
+        json.dumps({"tracing": {"experiment_id": "1575579281444652"}}), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        publisher,
+        "mlflow",
+        SimpleNamespace(
+            set_tracking_uri=lambda *_args: None,
+            set_registry_uri=lambda *_args: None,
+            set_experiment=lambda **kwargs: set_experiment_calls.append(kwargs),
+            start_run=lambda: Run(),
+            pyfunc=SimpleNamespace(log_model=lambda **_kwargs: model_info),
+        ),
+    )
+
+    version = register_model(
+        deploy_dir=tmp_path,
+        profile_path=tmp_path / "profile.json",
+        model_name="simo_prod.mysql_cdc_sync.haystack_agent_router",
+    )
+
+    assert version == "24"
+    assert set_experiment_calls == [{"experiment_id": "1575579281444652"}]
+
+
 def test_obo_auth_policy_requests_model_serving_scope():
     assert obo_auth_policy().to_dict() == {
         "system_auth_policy": {},
@@ -69,6 +107,37 @@ def test_obo_auth_policy_declares_lakebase_as_system_resource():
         },
         "user_auth_policy": {"api_scopes": ["model-serving", "ai-gateway"]},
     }
+
+
+def test_profile_serving_endpoint_names_collects_orchestration_routes():
+    profile = {
+        "default_route": "serving-endpoints/databricks-claude-haiku-4-5",
+        "route_metadata": {"backend": "databricks_serving", "endpoint": "databricks-claude-haiku-4-5"},
+        "route_metadata_by_route": {
+            "serving-endpoints/databricks-claude-sonnet-5": {
+                "backend": "databricks_serving",
+                "endpoint": "databricks-claude-sonnet-5",
+            }
+        },
+        "model_bindings": [
+            {"ref": "serving-endpoints/databricks-gpt-5-3-codex"},
+            {"ref": "model-services/simo_prod.ai_models.route_claude-sonnet-5"},
+        ],
+    }
+
+    assert profile_serving_endpoint_names(profile) == (
+        "databricks-claude-haiku-4-5",
+        "databricks-claude-sonnet-5",
+        "databricks-gpt-5-3-codex",
+    )
+
+
+def test_obo_auth_policy_declares_upstream_serving_endpoints():
+    resources = obo_auth_policy(
+        serving_endpoint_names=("databricks-claude-haiku-4-5", "databricks-gpt-5-3-codex")
+    ).to_dict()["system_auth_policy"]["resources"]["databricks"]["serving_endpoint"]
+
+    assert resources == [{"name": "databricks-claude-haiku-4-5"}, {"name": "databricks-gpt-5-3-codex"}]
 
 
 def test_lakebase_resource_name_uses_project_parent():
@@ -101,7 +170,7 @@ def test_profile_tracing_environment_uses_databricks_tracking_uri(tmp_path: Path
                     "experiment_name": "/Users/test@example.com/router",
                     "experiment_id": "123456789",
                     "sampling_ratio": 1.0,
-                    "capture_content": False,
+                    "capture_content": True,
                     "beta": True,
                 }
             }
@@ -113,7 +182,7 @@ def test_profile_tracing_environment_uses_databricks_tracking_uri(tmp_path: Path
         "MLFLOW_TRACKING_URI": "databricks",
         "MLFLOW_EXPERIMENT_ID": "123456789",
         "MLFLOW_TRACE_SAMPLING_RATIO": "1.0",
-        "MLFLOW_TRACE_CAPTURE_CONTENT": "false",
+        "MLFLOW_TRACE_CAPTURE_CONTENT": "true",
         "MLFLOW_TRACE_BETA": "true",
     }
 

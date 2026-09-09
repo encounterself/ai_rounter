@@ -361,6 +361,9 @@
             "require_approval"
           ]
         },
+        "router_model_binding": {
+          "$ref": "#/$defs/identifier"
+        },
         "routes": {
           "type": "array",
           "items": {

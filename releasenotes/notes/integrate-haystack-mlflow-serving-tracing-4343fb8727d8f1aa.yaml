@@ -1,0 +1,8 @@
+---
+enhancements:
+  - |
+    Connect Haystack's native tracing spans to MLflow tracing in Databricks
+    Model Serving while preserving content redaction and bounded request metadata.
+    Serving deployments now include the OpenTelemetry Haystack integration,
+    semantic scenario routing, and a mandatory coding review-to-implementation
+    graph with per-node prompts, skills, and MCP bindings.

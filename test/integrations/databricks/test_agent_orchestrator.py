@@ -6,8 +6,17 @@ from contracts.runtime.haystack_agent_serving.loader import AgentServingSnapshot
 from contracts.runtime.haystack_agent_serving.tests.test_loader import valid_profile
 from haystack.dataclasses import ChatMessage, ToolCall
 from haystack.tools import Tool, Toolset
-from integrations.databricks.agent_orchestrator import ConfiguredAgentOrchestrator
+from integrations.databricks.agent_orchestrator import ConfiguredAgentOrchestrator, _parse_routing_result
 from integrations.databricks.ai_gateway import GatewayConfig
+
+
+def test_parse_routing_result_accepts_fenced_classification_json() -> None:
+    result = _parse_routing_result(
+        '```json\n{"classification":"coding","confidence":0.91,"reason":"code change"}\n```\nextra {"broken":',
+        ("daily", "writing", "coding"),
+    )
+
+    assert result == {"scenario": "coding", "confidence": 0.91, "reason": "code change"}
 
 
 def test_profile_routes_prompt_skill_and_model_through_haystack_agent() -> None:
@@ -283,12 +292,7 @@ def _multi_agent_profile() -> dict:
                 "agent_tools": ["review-tool", "coding-tool"],
                 "policy_route": "coding",
             },
-            {
-                "id": "review",
-                "kind": "model",
-                "model_binding": "review",
-                "prompt_bindings": ["review-prompt"],
-            },
+            {"id": "review", "kind": "model", "model_binding": "review", "prompt_bindings": ["review-prompt"]},
             {
                 "id": "coder",
                 "kind": "model",
@@ -298,10 +302,7 @@ def _multi_agent_profile() -> dict:
             },
             {"id": "response", "kind": "output"},
         ],
-        "edges": [
-            {"source": "request", "target": "coordinator"},
-            {"source": "coordinator", "target": "response"},
-        ],
+        "edges": [{"source": "request", "target": "coordinator"}, {"source": "coordinator", "target": "response"}],
     }
     profile["agent_tools"] = [
         {
@@ -309,9 +310,7 @@ def _multi_agent_profile() -> dict:
             "node": "review",
             "name": "review_code",
             "description": "Review code.",
-            "outputs_to_state": {
-                "review_findings": {"source": "last_message", "handler": "message_text"}
-            },
+            "outputs_to_state": {"review_findings": {"source": "last_message", "handler": "message_text"}},
         },
         {
             "id": "coding-tool",
@@ -323,24 +322,9 @@ def _multi_agent_profile() -> dict:
     ]
     profile["state_schema"] = {"review_findings": {"type": "string", "persist": True}}
     profile["model_bindings"] = [
-        {
-            "id": "coordinator",
-            "ref": "serving-endpoints/coordinator",
-            "protocol": "chat_completions",
-            "tools": True,
-        },
-        {
-            "id": "review",
-            "ref": "serving-endpoints/reviewer",
-            "protocol": "chat_completions",
-            "tools": False,
-        },
-        {
-            "id": "coder",
-            "ref": "serving-endpoints/coder",
-            "protocol": "chat_completions",
-            "tools": True,
-        },
+        {"id": "coordinator", "ref": "serving-endpoints/coordinator", "protocol": "chat_completions", "tools": True},
+        {"id": "review", "ref": "serving-endpoints/reviewer", "protocol": "chat_completions", "tools": False},
+        {"id": "coder", "ref": "serving-endpoints/coder", "protocol": "chat_completions", "tools": True},
     ]
     profile["policy_router"]["routes"] = [
         {
@@ -402,7 +386,7 @@ def test_coordinator_agent_tools_transfer_review_state_to_coder() -> None:
                 ]
             ),
             ChatMessage.from_assistant("FINAL_RESULT"),
-        ],
+        ]
     )
 
     search_tool = Tool(
@@ -451,12 +435,75 @@ def test_coordinator_keeps_specialist_model_and_mcp_bindings() -> None:
     }
 
     tools = orchestrator._agent_tools_for_node(
-        result.snapshot.agent_graph.nodes[1],
-        {"scenario": "coding"},
-        trace_span_factory=None,
-        building=frozenset(),
+        result.snapshot.agent_graph.nodes[1], {"scenario": "coding"}, trace_span_factory=None, building=frozenset()
     )
 
     assert [tool.name for tool in tools] == ["review_code", "implement_code"]
     assert orchestrator._generators["review"] is not orchestrator._generators["coordinator"]
     assert orchestrator._generators["coder"] is not orchestrator._generators["coordinator"]
+
+
+def test_semantic_router_selects_coding_and_requires_review_before_implementation() -> None:
+    import json
+    from pathlib import Path
+
+    profile = json.loads(Path("deploy/databricks/orchestration.profile.example.json").read_text(encoding="utf-8"))
+    for binding in profile["model_bindings"]:
+        binding["protocol"] = "chat_completions"
+    loaded = AgentServingSnapshotLoader().load_mapping(profile)
+    assert loaded.accepted and loaded.snapshot is not None
+
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        requests.append(payload)
+        messages = payload.get("messages", [])
+        system = " ".join(
+            str(item.get("content", "")) for item in messages if isinstance(item, dict) and item.get("role") == "system"
+        )
+        if "Classify the request" in system:
+            content = '{"scenario":"coding","confidence":0.98,"reason":"code change"}'
+        elif "You are the coding agent" in system:
+            content = "IMPLEMENTED_AFTER_REVIEW"
+        elif "code review agent" in system:
+            content = "REVIEW_FINDING: validate input and add regression coverage"
+        else:
+            content = "IMPLEMENTED_AFTER_REVIEW"
+        return httpx.Response(
+            200, json={"choices": [{"message": {"role": "assistant", "content": content}}]}, request=request
+        )
+
+    gateway_config = GatewayConfig.from_mapping(
+        {
+            "providers": [{"id": "db", "kind": "databricks_serving", "protocols": ["chat_completions"]}],
+            "routes": [
+                {"id": binding.id, "provider": "db", "target": binding.ref, "protocols": ["chat_completions"]}
+                for binding in loaded.snapshot.model_bindings.values()
+            ],
+        }
+    )
+    orchestrator = ConfiguredAgentOrchestrator(
+        loaded.snapshot,
+        gateway_config,
+        host="https://workspace.example",
+        transport=httpx.MockTransport(handler),
+        prompt_sources=profile["prompt_sources"],
+        skill_sources=profile["skill_sources"],
+    )
+
+    result = orchestrator.run([ChatMessage.from_user("Please fix this code and add tests")], request={})
+
+    assert result.meta["scenario"] == "coding"
+    assert result.meta["routing"]["mode"] == "llm"
+    assert result.meta["routing"]["confidence"] == 0.98
+    assert result.meta["graph_path"] == ["request", "review", "coding", "response"]
+    assert [node["node_id"] for node in result.meta["nodes"]] == ["smart-router", "review", "coding"]
+    assert result.replies[0].text == "IMPLEMENTED_AFTER_REVIEW"
+    assert len(requests) == 3
+    coding_system = " ".join(
+        str(item.get("content", ""))
+        for item in requests[-1].get("messages", [])
+        if isinstance(item, dict) and item.get("role") == "system"
+    )
+    assert "REVIEW_FINDING" in coding_system

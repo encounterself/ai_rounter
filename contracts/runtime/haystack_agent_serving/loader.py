@@ -137,6 +137,7 @@ class PolicyRoute:
 class PolicyRouter:
     default_action: str
     routes: tuple[PolicyRoute, ...]
+    router_model_binding: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +201,11 @@ class AgentServingSnapshot:
             },
             "policy_router": {
                 "default_action": self.policy_router.default_action,
+                **(
+                    {"router_model_binding": self.policy_router.router_model_binding}
+                    if self.policy_router.router_model_binding is not None
+                    else {}
+                ),
                 "routes": [
                     {
                         "id": route.id,
@@ -388,6 +394,7 @@ def _build_snapshot(raw: Mapping[str, Any]) -> AgentServingSnapshot:
     )
     router = PolicyRouter(
         default_action=router_data["default_action"],
+        router_model_binding=router_data.get("router_model_binding"),
         routes=tuple(
             PolicyRoute(
                 id=route["id"],
@@ -451,8 +458,9 @@ def _semantic_issues(raw: Mapping[str, Any]) -> list[ValidationIssue]:
     state_schema = raw.get("state_schema", {})
     state_ids = set(state_schema)
     graph_data = raw["agent_graph"]
+    router_data = raw["policy_router"]
     node_ids = unique_ids(graph_data["nodes"], "/agent_graph/nodes")
-    route_ids = unique_ids(raw["policy_router"]["routes"], "/policy_router/routes")
+    route_ids = unique_ids(router_data["routes"], "/policy_router/routes")
 
     reserved_state_keys = {"messages", "step_count", "token_usage", "tool_call_counts", "exit_reason"}
     for state_key, definition in state_schema.items():
@@ -463,12 +471,12 @@ def _semantic_issues(raw: Mapping[str, Any]) -> list[ValidationIssue]:
         if definition.get("handler") == "append" and definition.get("type") not in {"array", "list"}:
             issues.append(
                 ValidationIssue(
-                    f"/state_schema/{state_key}/handler",
-                    "append state handler requires an array/list state field",
+                    f"/state_schema/{state_key}/handler", "append state handler requires an array/list state field"
                 )
             )
 
     _require_ref(graph_data["entry_node"], node_ids, "/agent_graph/entry_node", issues)
+    _require_ref(router_data.get("router_model_binding"), model_ids, "/policy_router/router_model_binding", issues)
     for index, terminal in enumerate(graph_data["terminal_nodes"]):
         _require_ref(terminal, node_ids, f"/agent_graph/terminal_nodes/{index}", issues)
     for index, edge in enumerate(graph_data["edges"]):
@@ -478,8 +486,7 @@ def _semantic_issues(raw: Mapping[str, Any]) -> list[ValidationIssue]:
         if node.get("agent_tools") and node.get("kind") != "model":
             issues.append(
                 ValidationIssue(
-                    f"/agent_graph/nodes/{index}/agent_tools",
-                    "AgentTool bindings may only be attached to model nodes",
+                    f"/agent_graph/nodes/{index}/agent_tools", "AgentTool bindings may only be attached to model nodes"
                 )
             )
         _require_ref(node.get("model_binding"), model_ids, f"/agent_graph/nodes/{index}/model_binding", issues)
@@ -493,12 +500,7 @@ def _semantic_issues(raw: Mapping[str, Any]) -> list[ValidationIssue]:
     for index, binding in enumerate(raw.get("agent_tools", ())):
         _require_ref(binding.get("node"), node_ids, f"/agent_tools/{index}/node", issues)
         for state_key, source in binding.get("inputs_from_state", {}).items():
-            _require_ref(
-                state_key,
-                state_ids,
-                f"/agent_tools/{index}/inputs_from_state/{state_key}",
-                issues,
-            )
+            _require_ref(state_key, state_ids, f"/agent_tools/{index}/inputs_from_state/{state_key}", issues)
             if not isinstance(source, str) or not _IDENTIFIER_RE.fullmatch(source):
                 issues.append(
                     ValidationIssue(
@@ -507,12 +509,7 @@ def _semantic_issues(raw: Mapping[str, Any]) -> list[ValidationIssue]:
                     )
                 )
         for state_key in binding.get("outputs_to_state", {}):
-            _require_ref(
-                state_key,
-                state_ids,
-                f"/agent_tools/{index}/outputs_to_state/{state_key}",
-                issues,
-            )
+            _require_ref(state_key, state_ids, f"/agent_tools/{index}/outputs_to_state/{state_key}", issues)
 
     _validate_agent_tool_targets(raw, node_ids, issues)
     for index, route in enumerate(raw["policy_router"]["routes"]):
@@ -532,9 +529,7 @@ def _semantic_issues(raw: Mapping[str, Any]) -> list[ValidationIssue]:
     return issues
 
 
-def _validate_agent_tool_targets(
-    raw: Mapping[str, Any], node_ids: set[str], issues: list[ValidationIssue]
-) -> None:
+def _validate_agent_tool_targets(raw: Mapping[str, Any], node_ids: set[str], issues: list[ValidationIssue]) -> None:
     """Validate AgentTool target kinds and reject recursive delegation graphs."""
 
     nodes = {node["id"]: node for node in raw["agent_graph"]["nodes"] if isinstance(node, Mapping)}
@@ -546,12 +541,7 @@ def _validate_agent_tool_targets(
         if target not in node_ids:
             continue
         if target_node is None or target_node.get("kind") != "model":
-            issues.append(
-                ValidationIssue(
-                    f"/agent_tools/{index}/node",
-                    "AgentTool target must reference a model node",
-                )
-            )
+            issues.append(ValidationIssue(f"/agent_tools/{index}/node", "AgentTool target must reference a model node"))
 
     for node_index, node in enumerate(raw["agent_graph"]["nodes"]):
         source = node.get("id")
@@ -581,10 +571,7 @@ def _validate_agent_tool_targets(
             if normalized not in reported:
                 reported.add(normalized)
                 issues.append(
-                    ValidationIssue(
-                        "/agent_tools",
-                        f"AgentTool delegation cycle detected: {' -> '.join(cycle)}",
-                    )
+                    ValidationIssue("/agent_tools", f"AgentTool delegation cycle detected: {' -> '.join(cycle)}")
                 )
             return
         if node_id in visited:

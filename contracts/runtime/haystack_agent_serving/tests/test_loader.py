@@ -265,9 +265,7 @@ class SnapshotLoaderTests(unittest.TestCase):
         """Serialize and reload delegated tools and their state contract."""
 
         profile = valid_profile()
-        profile["agent_graph"]["nodes"].insert(
-            2, {"id": "review", "kind": "model", "model_binding": "primary"}
-        )
+        profile["agent_graph"]["nodes"].insert(2, {"id": "review", "kind": "model", "model_binding": "primary"})
         profile["agent_graph"]["edges"] = [
             {"source": "request", "target": "planner"},
             {"source": "planner", "target": "response"},
@@ -279,9 +277,7 @@ class SnapshotLoaderTests(unittest.TestCase):
                 "node": "review",
                 "name": "review_code",
                 "description": "Review code.",
-                "outputs_to_state": {
-                    "review_findings": {"source": "last_message", "handler": "message_text"}
-                },
+                "outputs_to_state": {"review_findings": {"source": "last_message", "handler": "message_text"}},
             }
         ]
         profile["agent_graph"]["nodes"][1]["agent_tools"] = ["review-tool"]
@@ -293,9 +289,7 @@ class SnapshotLoaderTests(unittest.TestCase):
         assert result.snapshot is not None
         serialized = result.snapshot.to_dict()
         self.assertEqual(serialized["state_schema"]["review_findings"]["type"], "string")
-        self.assertEqual(
-            serialized["agent_tools"][0]["outputs_to_state"]["review_findings"]["handler"], "message_text"
-        )
+        self.assertEqual(serialized["agent_tools"][0]["outputs_to_state"]["review_findings"]["handler"], "message_text")
         reloaded = loader.load_mapping(serialized)
         self.assertTrue(reloaded.accepted, reloaded.issues)
 
@@ -329,7 +323,12 @@ class SnapshotLoaderTests(unittest.TestCase):
             {"source": "planner", "target": "response"},
         ]
         profile["agent_tools"] = [
-            {"id": "planner-to-specialist", "node": "specialist", "name": "delegate_specialist", "description": "Delegate."},
+            {
+                "id": "planner-to-specialist",
+                "node": "specialist",
+                "name": "delegate_specialist",
+                "description": "Delegate.",
+            },
             {"id": "specialist-to-planner", "node": "planner", "name": "delegate_planner", "description": "Delegate."},
         ]
         profile["agent_graph"]["nodes"][1]["agent_tools"] = ["planner-to-specialist"]

@@ -10,6 +10,7 @@ import queue
 import sys
 import threading
 from collections.abc import Iterator, Mapping
+from contextvars import copy_context
 from importlib import util as importlib_util
 from pathlib import Path
 from types import ModuleType
@@ -22,7 +23,7 @@ if __package__:
     from .gateway_client import GatewayClient, GatewayError, GatewaySettings, new_correlation_id, safe_error
     from .profile_loader import ProfileError, load_profile, validate_profile
     from .serving_runtime import LocalServingRuntime
-    from .tracing import TracingConfig, start_span
+    from .tracing import TracingConfig, configure_haystack_mlflow_tracing, start_span
 else:
 
     def _code_path_directories() -> list[str]:
@@ -73,6 +74,7 @@ else:
     validate_profile = _profile_loader.validate_profile
     LocalServingRuntime = _serving_runtime.LocalServingRuntime
     TracingConfig = _tracing.TracingConfig
+    configure_haystack_mlflow_tracing = _tracing.configure_haystack_mlflow_tracing
     start_span = _tracing.start_span
     try:
         _session_store = importlib.import_module(f"{_package_name}.session_store")
@@ -188,7 +190,7 @@ def normalize_request(request: Any) -> dict[str, Any]:
         "turn_id": custom_inputs.get("turn_id") or metadata.get("turn_id") or str(uuid4()),
         "tenant_id": custom_inputs.get("tenant_id") or metadata.get("tenant_id") or "default",
         "user_id": custom_inputs.get("user_id") or metadata.get("user_id"),
-        "scenario": custom_inputs.get("scenario") or metadata.get("scenario") or "daily",
+        "scenario": custom_inputs.get("scenario") or metadata.get("scenario"),
         "correlation_id": _request_value(request, "correlation_id"),
         "request_id": _request_value(request, "request_id"),
     }
@@ -302,11 +304,13 @@ class Agent(ResponsesAgent):
         loaded_profile = dict(profile)
         if "schema_version" in loaded_profile and "agent_graph" in loaded_profile:
             self.tracing = TracingConfig.from_env(loaded_profile)
+            configure_haystack_mlflow_tracing(self.tracing)
             self._configure_orchestrator(loaded_profile)
             self.profile = loaded_profile
             return
         validate_profile(loaded_profile)
         self.tracing = TracingConfig.from_env(loaded_profile)
+        configure_haystack_mlflow_tracing(self.tracing)
         settings = GatewaySettings.from_env(loaded_profile)
         self.runtime = LocalServingRuntime(GatewayClient(settings), tracing=TracingConfig.from_env(loaded_profile))
         self.profile = loaded_profile
@@ -449,7 +453,7 @@ class Agent(ResponsesAgent):
                     "turn_id": normalized["turn_id"],
                     "tenant_id": normalized["tenant_id"],
                     "user_id": normalized["user_id"],
-                    "scenario": normalized["scenario"],
+                    "scenario": normalized["scenario"] or "daily",
                     "agent_profile": self.profile.get("name") if self.profile else None,
                     "endpoint_name": os.getenv("HAYSTACK_SERVING_ENDPOINT_NAME"),
                     "served_entity_name": os.getenv("HAYSTACK_SERVED_ENTITY_NAME"),
@@ -478,21 +482,51 @@ class Agent(ResponsesAgent):
         """Execute one streaming Responses request."""
 
         correlation_id = str(_request_value(request, "correlation_id") or new_correlation_id())
+        output_item_id = f"msg_{correlation_id}"
+        streamed_any = False
         try:
             normalized = normalize_request(request)
             self._require_configured("predict_stream")
             if self.orchestrator is not None:
                 events: queue.Queue[tuple[str, Any]] = queue.Queue()
                 cancelled = threading.Event()
+                stream_span = start_span(
+                    self.tracing,
+                    correlation_id=correlation_id,
+                    request_id=str(normalized.get("request_id") or new_correlation_id()),
+                    model=str(normalized.get("model")) if normalized.get("model") else None,
+                    route=self.profile.get("default_route") if self.profile else None,
+                    provider="haystack",
+                    session_id=normalized.get("session_id"),
+                    turn_id=normalized.get("turn_id"),
+                    user_id=normalized.get("user_id"),
+                    tenant_id=normalized.get("tenant_id"),
+                    scenario=normalized.get("scenario"),
+                    agent_profile=self.profile.get("name") if self.profile else None,
+                    protocol="haystack_agent",
+                    endpoint_name=os.getenv("HAYSTACK_SERVING_ENDPOINT_NAME"),
+                    served_entity_name=os.getenv("HAYSTACK_SERVED_ENTITY_NAME"),
+                    model_version=os.getenv("HAYSTACK_SERVED_MODEL_VERSION"),
+                    streamed=True,
+                    payload={"input": normalized.get("input"), "stream": True},
+                )
+                stream_span.__enter__()
 
                 def capture_chunk(chunk: Any) -> None:
                     if not cancelled.is_set():
+                        stream_span.mark_first_token()
                         events.put(("chunk", chunk))
+
+                request_context = copy_context()
 
                 def run_request() -> None:
                     try:
-                        response = self._predict_orchestrated(
-                            normalized, correlation_id=correlation_id, streaming_callback=capture_chunk
+                        response = request_context.run(
+                            self._predict_orchestrated,
+                            normalized,
+                            correlation_id=correlation_id,
+                            streaming_callback=capture_chunk,
+                            output_item_id=output_item_id,
                         )
                     except BaseException as error:
                         events.put(("error", error))
@@ -511,31 +545,53 @@ class Agent(ResponsesAgent):
                             event = {
                                 "type": "response.output_text.delta",
                                 "delta": str(text),
-                                "item_id": f"msg_{correlation_id}",
+                                "item_id": output_item_id,
                                 "output_index": 0,
                                 "content_index": 0,
                             }
                             if ResponsesAgentStreamEvent is not None:
                                 try:
+                                    streamed_any = True
                                     yield ResponsesAgentStreamEvent(**event)
                                     continue
                                 except (TypeError, ValueError):
                                     pass
+                            streamed_any = True
                             yield event
                             continue
                         if kind == "error":
+                            stream_span.finish(error={"exception_type": type(payload).__name__})
                             raise payload
                         data = payload if isinstance(payload, Mapping) else payload.model_dump()
                         output = data.get("output", [])
+                        stream_span.finish(attributes=self._stream_trace_attributes(data))
                         if output:
-                            event = {"type": "response.output_item.done", "item": output[0]}
+                            item = dict(output[0]) if isinstance(output[0], Mapping) else output[0]
+                            if isinstance(item, dict):
+                                item.setdefault("id", output_item_id)
+                            event = {"type": "response.output_item.done", "item": item}
                             if ResponsesAgentStreamEvent is not None:
                                 try:
+                                    streamed_any = True
                                     yield ResponsesAgentStreamEvent(**event)
+                                except (TypeError, ValueError):
+                                    streamed_any = True
+                                    yield event
+                            else:
+                                streamed_any = True
+                                yield event
+                            completed = {"type": "response.completed", "response": data}
+                            if ResponsesAgentStreamEvent is not None:
+                                try:
+                                    streamed_any = True
+                                    yield ResponsesAgentStreamEvent(**completed)
                                     return
                                 except (TypeError, ValueError):
-                                    pass
-                            yield event
+                                    streamed_any = True
+                                    yield completed
+                                    return
+                            streamed_any = True
+                            yield completed
                         return
                 finally:
                     cancelled.set()
@@ -554,7 +610,7 @@ class Agent(ResponsesAgent):
                     "turn_id": normalized["turn_id"],
                     "tenant_id": normalized["tenant_id"],
                     "user_id": normalized["user_id"],
-                    "scenario": normalized["scenario"],
+                    "scenario": normalized["scenario"] or "daily",
                     "agent_profile": self.profile.get("name") if self.profile else None,
                 }
             )
@@ -574,6 +630,34 @@ class Agent(ResponsesAgent):
                     previous_revision,
                 )
         except Exception as exc:
+            if self.orchestrator is not None and not streamed_any:
+                try:
+                    fallback_response = self._predict_orchestrated(
+                        normalized, correlation_id=correlation_id, output_item_id=output_item_id
+                    )
+                    fallback_data = (
+                        fallback_response.model_dump()
+                        if callable(getattr(fallback_response, "model_dump", None))
+                        else fallback_response
+                    )
+                    fallback_output = fallback_data.get("output", []) if isinstance(fallback_data, Mapping) else []
+                    if fallback_output:
+                        stream_span.finish(
+                            attributes={
+                                **self._stream_trace_attributes(fallback_response),
+                                "fallback_reason": type(exc).__name__,
+                            }
+                        )
+                        fallback_item = (
+                            dict(fallback_output[0]) if isinstance(fallback_output[0], Mapping) else fallback_output[0]
+                        )
+                        if isinstance(fallback_item, dict):
+                            fallback_item.setdefault("id", output_item_id)
+                        yield {"type": "response.output_item.done", "item": fallback_item}
+                        yield {"type": "response.completed", "response": fallback_data}
+                        return
+                except Exception:
+                    pass
             yield from self._stream_error_event(
                 safe_error(
                     exc,
@@ -586,7 +670,7 @@ class Agent(ResponsesAgent):
                 correlation_id,
             )
 
-    def _responses_response(self, result: Any) -> Any:
+    def _responses_response(self, result: Any, *, item_id: str | None = None) -> Any:
         if isinstance(result, Mapping) and "output" in result:
             if ResponsesAgentResponse is not None:
                 return ResponsesAgentResponse(**dict(result))
@@ -602,7 +686,7 @@ class Agent(ResponsesAgent):
                     raw_tool_calls = message.get("tool_calls", [])
                     if isinstance(raw_tool_calls, list):
                         tool_calls = [call for call in raw_tool_calls if isinstance(call, Mapping)]
-        item_id = f"msg_{uuid4().hex}"
+        item_id = item_id or f"msg_{uuid4().hex}"
         output_items: list[Any] = []
         if text:
             output_items.append(
@@ -646,13 +730,72 @@ class Agent(ResponsesAgent):
             messages.append({"role": "assistant", "content": "".join(text_parts)})
         return messages
 
+    @staticmethod
+    def _stream_trace_attributes(response: Any) -> dict[str, Any]:
+        data = response.model_dump() if callable(getattr(response, "model_dump", None)) else response
+        if not isinstance(data, Mapping):
+            return {"status": "completed"}
+        custom_outputs = data.get("custom_outputs")
+        orchestration = custom_outputs.get("orchestration") if isinstance(custom_outputs, Mapping) else None
+        if not isinstance(orchestration, Mapping):
+            return {"status": "completed"}
+        nodes = orchestration.get("nodes", [])
+        node_items = [node for node in nodes if isinstance(node, Mapping)] if isinstance(nodes, (list, tuple)) else []
+        return {
+            "status": "completed",
+            "policy_route": orchestration.get("policy_route"),
+            "scenario": orchestration.get("scenario", "unknown"),
+            "node_count": len(node_items),
+            "routing_mode": (orchestration.get("routing") or {}).get("mode", "unknown")
+            if isinstance(orchestration.get("routing"), Mapping)
+            else "unknown",
+            "router_model": (orchestration.get("routing") or {}).get("router_model", "none")
+            if isinstance(orchestration.get("routing"), Mapping)
+            else "none",
+            "selected_scenario": (orchestration.get("routing") or {}).get(
+                "scenario", orchestration.get("scenario", "unknown")
+            )
+            if isinstance(orchestration.get("routing"), Mapping)
+            else orchestration.get("scenario", "unknown"),
+            "routing_confidence": (orchestration.get("routing") or {}).get("confidence", 0.0)
+            if isinstance(orchestration.get("routing"), Mapping)
+            else 0.0,
+            "routing_reason": (orchestration.get("routing") or {}).get("reason", "not supplied")
+            if isinstance(orchestration.get("routing"), Mapping)
+            else "not supplied",
+            "models": [node.get("model") for node in node_items if node.get("model")],
+            "model_targets": [node.get("model_target") for node in node_items if node.get("model_target")],
+            "routes": [node.get("route") for node in node_items if node.get("route")],
+            "protocols": [node.get("protocol") for node in node_items if node.get("protocol")],
+            "providers": [node.get("provider") for node in node_items if node.get("provider")],
+            "provider_kinds": [node.get("provider_kind") for node in node_items if node.get("provider_kind")],
+            "route_attempts": [attempt for node in node_items for attempt in node.get("route_attempts", []) if attempt],
+            "mcp_bindings": [node.get("mcp_binding") for node in node_items if node.get("mcp_binding")],
+            "skill_bindings": [binding for node in node_items for binding in node.get("skill_bindings", []) if binding],
+            "prompt_binding_ids": [
+                binding for node in node_items for binding in node.get("prompt_binding_ids", []) if binding
+            ],
+            "tool_count": sum(int(node.get("tool_count", 0) or 0) for node in node_items),
+            "tool_names": [tool for node in node_items for tool in node.get("tool_names", []) if tool],
+            "nodes": nodes,
+        }
+
     def _predict_orchestrated(
-        self, normalized: Mapping[str, Any], *, correlation_id: str | None = None, streaming_callback: Any = None
+        self,
+        normalized: Mapping[str, Any],
+        *,
+        correlation_id: str | None = None,
+        streaming_callback: Any = None,
+        output_item_id: str | None = None,
     ) -> Any:
         if ChatMessage is None or self.orchestrator is None:
             raise ProfileError("haystack_unavailable", "Haystack orchestration dependencies are not installed")
-        input_messages, revision, previous_state = self._restore_session(normalized)
-        messages = [ChatMessage.from_openai_dict_format(_canonical_message(item)) for item in input_messages]
+        orchestration_request: dict[str, Any] = {
+            "scenario": normalized.get("scenario"),
+            "tenant_id": normalized.get("tenant_id"),
+            "user_id": normalized.get("user_id"),
+            "session_id": normalized.get("session_id"),
+        }
         span = start_span(
             self.tracing,
             correlation_id=str(correlation_id or normalized.get("correlation_id") or new_correlation_id()),
@@ -668,53 +811,69 @@ class Agent(ResponsesAgent):
             agent_profile=self.profile.get("name") if self.profile else None,
             protocol="haystack_agent",
             streamed=streaming_callback is not None,
+            payload={"input": normalized.get("input"), "stream": streaming_callback is not None},
             metadata={"agent_profile": self.profile.get("name") if self.profile else None},
         )
         span.__enter__()
+
+        def trace_child(metadata: Mapping[str, Any]) -> Any:
+            child_metadata = dict(metadata)
+            return start_span(
+                self.tracing,
+                correlation_id=str(correlation_id or normalized.get("correlation_id") or new_correlation_id()),
+                request_id=str(normalized.get("request_id") or new_correlation_id()),
+                model=str(child_metadata.get("model")) if child_metadata.get("model") else None,
+                route=str(child_metadata.get("route")) if child_metadata.get("route") else None,
+                provider=str(child_metadata.get("provider") or "haystack"),
+                parent_span_id=(
+                    span.span_id if child_metadata.get("node_id") and not child_metadata.get("span_name") else None
+                ),
+                session_id=normalized.get("session_id"),
+                turn_id=normalized.get("turn_id"),
+                tenant_id=normalized.get("tenant_id"),
+                user_id=normalized.get("user_id"),
+                scenario=orchestration_request.get("scenario"),
+                agent_profile=self.profile.get("name") if self.profile else None,
+                protocol=child_metadata.get("protocol"),
+                model_target=child_metadata.get("model_target"),
+                provider_kind=child_metadata.get("provider_kind"),
+                endpoint_name=os.getenv("HAYSTACK_SERVING_ENDPOINT_NAME"),
+                served_entity_name=os.getenv("HAYSTACK_SERVED_ENTITY_NAME"),
+                model_version=os.getenv("HAYSTACK_SERVED_MODEL_VERSION"),
+                streamed=streaming_callback is not None,
+                routing_mode=(orchestration_request.get("routing") or {}).get("mode", "unknown"),
+                router_model=(orchestration_request.get("routing") or {}).get("router_model", "none"),
+                selected_scenario=(orchestration_request.get("routing") or {}).get(
+                    "scenario", orchestration_request.get("scenario", "unknown")
+                ),
+                routing_confidence=(orchestration_request.get("routing") or {}).get("confidence", 0.0),
+                routing_reason=(orchestration_request.get("routing") or {}).get("reason", "not supplied"),
+                span_name=child_metadata.get("span_name"),
+                span_type=child_metadata.get("span_type"),
+                payload=child_metadata.get("payload"),
+                metadata=child_metadata,
+            )
+
         try:
-            run_kwargs: dict[str, Any] = {
-                "request": {
-                    "scenario": normalized.get("scenario"),
-                    "tenant_id": normalized.get("tenant_id"),
-                    "user_id": normalized.get("user_id"),
-                    "session_id": normalized.get("session_id"),
-                },
-                "streaming_callback": streaming_callback,
-            }
+            input_messages, revision, previous_state = self._restore_session(normalized, trace_span_factory=trace_child)
+            messages = [ChatMessage.from_openai_dict_format(_canonical_message(item)) for item in input_messages]
+            run_kwargs: dict[str, Any] = {"request": orchestration_request, "streaming_callback": streaming_callback}
             if "state" in inspect.signature(self.orchestrator.run).parameters:
                 run_kwargs["state"] = previous_state
             if "trace_span_factory" in inspect.signature(self.orchestrator.run).parameters:
-                run_kwargs["trace_span_factory"] = lambda metadata: start_span(
-                    self.tracing,
-                    correlation_id=str(correlation_id or normalized.get("correlation_id") or new_correlation_id()),
-                    request_id=str(normalized.get("request_id") or new_correlation_id()),
-                    model=str(metadata.get("model")) if metadata.get("model") else None,
-                    route=str(metadata.get("route")) if metadata.get("route") else None,
-                    provider=str(metadata.get("provider") or "haystack"),
-                    parent_span_id=span.span_id,
-                    session_id=normalized.get("session_id"),
-                    turn_id=normalized.get("turn_id"),
-                    tenant_id=normalized.get("tenant_id"),
-                    scenario=normalized.get("scenario"),
-                    agent_profile=self.profile.get("name") if self.profile else None,
-                    protocol=metadata.get("protocol"),
-                    model_target=metadata.get("model_target"),
-                    provider_kind=metadata.get("provider_kind"),
-                    endpoint_name=os.getenv("HAYSTACK_SERVING_ENDPOINT_NAME"),
-                    served_entity_name=os.getenv("HAYSTACK_SERVED_ENTITY_NAME"),
-                    model_version=os.getenv("HAYSTACK_SERVED_MODEL_VERSION"),
-                    streamed=streaming_callback is not None,
-                    metadata=metadata,
-                )
+                run_kwargs["trace_span_factory"] = trace_child
             result = self.orchestrator.run(messages, **run_kwargs)
             reply = result.replies[-1]
-            response = self._responses_response({"choices": [{"message": reply.to_openai_dict_format()}]})
+            response = self._responses_response(
+                {"choices": [{"message": reply.to_openai_dict_format()}]}, item_id=output_item_id
+            )
             self._save_session(
                 normalized,
                 input_messages,
                 {"output": [reply.to_openai_dict_format()]},
                 revision,
                 agent_state=getattr(result, "state", {}),
+                trace_span_factory=trace_child,
             )
             nodes = result.meta.get("nodes", [])
             node_items = (
@@ -733,11 +892,17 @@ class Agent(ResponsesAgent):
                 binding for node in node_items for binding in node.get("prompt_binding_ids", []) if binding
             ]
             tool_names = [tool for node in node_items for tool in node.get("tool_names", []) if tool]
+            routing = result.meta.get("routing", {})
+            routing = routing if isinstance(routing, Mapping) else {}
+            orchestration_meta = dict(result.meta)
+            orchestration_meta["trace_id"] = span.trace_id
+            orchestration_meta["root_span_id"] = span.span_id
             span.finish(
                 attributes={
                     "status": "completed",
                     "response_id": _request_value(response, "id"),
                     "policy_route": result.meta.get("policy_route"),
+                    "scenario": result.meta.get("scenario", "unknown"),
                     "node_count": len(node_items),
                     "models": models,
                     "model_targets": model_targets,
@@ -752,21 +917,65 @@ class Agent(ResponsesAgent):
                     "tool_count": sum(int(node.get("tool_count", 0) or 0) for node in node_items),
                     "tool_names": tool_names,
                     "nodes": nodes,
+                    "routing_mode": routing.get("mode", "unknown"),
+                    "router_model": routing.get("router_model", "none"),
+                    "selected_scenario": routing.get("scenario", result.meta.get("scenario", "unknown")),
+                    "routing_confidence": routing.get("confidence", 0.0),
+                    "routing_reason": routing.get("reason", "not supplied"),
                 }
             )
             if ResponsesAgentResponse is not None and isinstance(response, ResponsesAgentResponse):
-                return _add_custom_outputs(response, {"orchestration": dict(result.meta)})
-            response["custom_outputs"] = {"orchestration": dict(result.meta)}
+                return _add_custom_outputs(
+                    response,
+                    {
+                        "orchestration": orchestration_meta,
+                        "trace": {"trace_id": span.trace_id, "root_span_id": span.span_id},
+                    },
+                )
+            response["custom_outputs"] = {
+                "orchestration": orchestration_meta,
+                "trace": {"trace_id": span.trace_id, "root_span_id": span.span_id},
+            }
             return response
         except Exception as exc:
             span.finish(error={"exception_type": type(exc).__name__, "error_code": "orchestration_error"})
             raise
 
-    def _restore_session(self, normalized: Mapping[str, Any]) -> tuple[list[Any], int | None, dict[str, Any]]:
+    def _restore_session(
+        self, normalized: Mapping[str, Any], *, trace_span_factory: Any = None
+    ) -> tuple[list[Any], int | None, dict[str, Any]]:
         session_id = normalized.get("session_id")
         if not session_id:
             return list(normalized["input"]), None, {}
-        snapshot = self.session_store.load(str(session_id), str(normalized.get("tenant_id") or "default"))
+        session_span = (
+            trace_span_factory(
+                {
+                    "span_name": "haystack.session.load",
+                    "span_type": "MEMORY",
+                    "route": "lakebase-session",
+                    "provider": "lakebase",
+                    "provider_kind": "postgres",
+                    "payload": {"session_id": str(session_id)},
+                }
+            )
+            if callable(trace_span_factory)
+            else None
+        )
+        if session_span is not None:
+            session_span.__enter__()
+        try:
+            snapshot = self.session_store.load(str(session_id), str(normalized.get("tenant_id") or "default"))
+        except Exception as error:
+            if session_span is not None:
+                session_span.finish(error={"exception_type": type(error).__name__, "error_code": "session_load_error"})
+            raise
+        if session_span is not None:
+            session_span.finish(
+                attributes={
+                    "status": "hit" if snapshot is not None else "miss",
+                    "revision": snapshot.revision if snapshot else 0,
+                }
+            )
         if snapshot is None:
             return _canonical_messages(normalized["input"]), None, {}
         stored_state = snapshot.state if isinstance(snapshot.state, Mapping) else {}
@@ -788,6 +997,7 @@ class Agent(ResponsesAgent):
         previous_revision: int | None,
         *,
         agent_state: Mapping[str, Any] | None = None,
+        trace_span_factory: Any = None,
     ) -> None:
         session_id = normalized.get("session_id")
         if not session_id:
@@ -800,23 +1010,43 @@ class Agent(ResponsesAgent):
                 for choice in result["choices"]:
                     if isinstance(choice, Mapping) and isinstance(choice.get("message"), Mapping):
                         state_messages.append(_canonical_message(choice["message"]))
+        session_span = (
+            trace_span_factory(
+                {
+                    "span_name": "haystack.session.save",
+                    "span_type": "MEMORY",
+                    "route": "lakebase-session",
+                    "provider": "lakebase",
+                    "provider_kind": "postgres",
+                    "payload": {"session_id": str(session_id), "expected_revision": previous_revision},
+                }
+            )
+            if callable(trace_span_factory)
+            else None
+        )
+        if session_span is not None:
+            session_span.__enter__()
         try:
             self.session_store.save(
                 str(session_id),
                 str(normalized.get("tenant_id") or "default"),
-                {
-                    "schema_version": 1,
-                    "messages": state_messages,
-                    "agent_state": dict(agent_state or {}),
-                },
+                {"schema_version": 1, "messages": state_messages, "agent_state": dict(agent_state or {})},
                 expected_revision=previous_revision,
                 agent_profile=self.profile.get("name") if self.profile else None,
                 route=self.profile.get("default_route") if self.profile else None,
                 model_alias=normalized.get("model"),
                 last_turn_id=str(normalized.get("turn_id")),
             )
+            if session_span is not None:
+                session_span.finish(attributes={"status": "completed", "revision": (previous_revision or 0) + 1})
         except SessionConflictError as exc:
+            if session_span is not None:
+                session_span.finish(error={"exception_type": type(exc).__name__, "error_code": "session_conflict"})
             raise RuntimeError("session was updated concurrently; retry with the same session_id") from exc
+        except Exception as error:
+            if session_span is not None:
+                session_span.finish(error={"exception_type": type(error).__name__, "error_code": "session_save_error"})
+            raise
 
     def _error_response(
         self, correlation_id: str, error_code: str, exception_type: str, diagnostic: Mapping[str, Any] | None = None

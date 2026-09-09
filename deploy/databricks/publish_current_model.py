@@ -16,7 +16,7 @@ from typing import Any
 
 import mlflow
 from mlflow.models.auth_policy import AuthPolicy, SystemAuthPolicy, UserAuthPolicy
-from mlflow.models.resources import Resource, ResourceType
+from mlflow.models.resources import DatabricksServingEndpoint, Resource, ResourceType
 
 
 class DatabricksAutoscalingPostgres(Resource):
@@ -69,12 +69,44 @@ def lakebase_resource_name(endpoint: str | None) -> str | None:
     return prefix
 
 
-def obo_auth_policy(*, lakebase_resource: str | None = None) -> AuthPolicy:
+def profile_serving_endpoint_names(profile: dict[str, Any]) -> tuple[str, ...]:
+    """Collect the Databricks Serving endpoints referenced by an orchestration profile."""
+
+    names: set[str] = set()
+
+    def add_route(route: Any, metadata: Any = None) -> None:
+        if isinstance(route, str) and route.startswith("serving-endpoints/"):
+            endpoint = route.removeprefix("serving-endpoints/")
+            if endpoint:
+                names.add(endpoint)
+        if isinstance(metadata, dict) and metadata.get("backend") == "databricks_serving":
+            endpoint = metadata.get("endpoint")
+            if isinstance(endpoint, str) and endpoint:
+                names.add(endpoint)
+
+    add_route(profile.get("default_route"), profile.get("route_metadata"))
+    route_metadata_by_route = profile.get("route_metadata_by_route")
+    if isinstance(route_metadata_by_route, dict):
+        for route, metadata in route_metadata_by_route.items():
+            add_route(route, metadata)
+    model_bindings = profile.get("model_bindings")
+    if isinstance(model_bindings, list):
+        for binding in model_bindings:
+            if isinstance(binding, dict):
+                add_route(binding.get("ref"))
+    return tuple(sorted(names))
+
+
+def obo_auth_policy(
+    *, lakebase_resource: str | None = None, serving_endpoint_names: tuple[str, ...] = ()
+) -> AuthPolicy:
     """Authorize serving dependencies and optional Lakebase system access."""
 
-    system_auth_policy = None
+    resources: list[Resource] = []
     if lakebase_resource:
-        system_auth_policy = SystemAuthPolicy(resources=[DatabricksAutoscalingPostgres(lakebase_resource)])
+        resources.append(DatabricksAutoscalingPostgres(lakebase_resource))
+    resources.extend(DatabricksServingEndpoint(name) for name in serving_endpoint_names)
+    system_auth_policy = SystemAuthPolicy(resources=resources) if resources else None
     return AuthPolicy(
         user_auth_policy=UserAuthPolicy(api_scopes=["model-serving", "ai-gateway"]),
         system_auth_policy=system_auth_policy,
@@ -125,9 +157,14 @@ def register_model(
 
     mlflow.set_tracking_uri("databricks")
     mlflow.set_registry_uri("databricks-uc")
-    if experiment_name:
-        mlflow.set_experiment(experiment_name)
     profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    if experiment_name:
+        mlflow.set_experiment(experiment_name=experiment_name)
+    else:
+        tracing = profile.get("tracing") if isinstance(profile, dict) else None
+        experiment_id = tracing.get("experiment_id") if isinstance(tracing, dict) else None
+        if experiment_id not in (None, ""):
+            mlflow.set_experiment(experiment_id=str(experiment_id))
     log_model_options: dict[str, Any] = {}
     if not (isinstance(profile, dict) and "schema_version" in profile and "agent_graph" in profile):
         log_model_options["input_example"] = {"input": [{"role": "user", "content": "health check"}], "stream": False}
@@ -139,7 +176,9 @@ def register_model(
             code_paths=[str(deploy_dir), str(repository_root / "integrations"), str(repository_root / "contracts")],
             artifacts={"profile": str(profile_path)},
             pip_requirements=str(deploy_dir / "requirements.txt"),
-            auth_policy=obo_auth_policy(lakebase_resource=lakebase_resource),
+            auth_policy=obo_auth_policy(
+                lakebase_resource=lakebase_resource, serving_endpoint_names=profile_serving_endpoint_names(profile)
+            ),
             registered_model_name=model_name,
             **log_model_options,
         )

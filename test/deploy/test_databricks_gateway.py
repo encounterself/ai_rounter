@@ -478,7 +478,7 @@ def test_responses_request_object_is_supported():
         "turn_id": normalized["turn_id"],
         "tenant_id": "default",
         "user_id": None,
-        "scenario": "daily",
+        "scenario": None,
         "correlation_id": "corr-object",
         "request_id": None,
     }
@@ -651,11 +651,7 @@ def test_orchestrated_stream_yields_before_agent_finishes(monkeypatch):
     agent = Agent(valid_profile())
 
     stream = agent.predict_stream(
-        {
-            "input": [{"role": "user", "content": "stream"}],
-            "stream": True,
-            "custom_inputs": {"scenario": "daily"},
-        }
+        {"input": [{"role": "user", "content": "stream"}], "stream": True, "custom_inputs": {"scenario": "daily"}}
     )
     first = next(stream)
     first_payload = first.model_dump() if callable(getattr(first, "model_dump", None)) else first
@@ -664,6 +660,53 @@ def test_orchestrated_stream_yields_before_agent_finishes(monkeypatch):
     assert first_payload["delta"] == "first"
     rest = list(stream)
     assert rest
+    done_payload = rest[-2].model_dump() if callable(getattr(rest[-2], "model_dump", None)) else rest[-2]
+    completed_payload = rest[-1].model_dump() if callable(getattr(rest[-1], "model_dump", None)) else rest[-1]
+    assert done_payload["type"] == "response.output_item.done"
+    assert done_payload["item"]["id"] == first_payload["item_id"]
+    assert completed_payload["type"] == "response.completed"
+    assert completed_payload["response"]["output"][0]["id"] == first_payload["item_id"]
+
+
+def test_orchestrated_stream_falls_back_before_first_chunk(monkeypatch):
+    class FakeOrchestrator:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def run(self, messages, *, request=None, streaming_callback=None, state=None):
+            if streaming_callback is not None:
+                raise KeyError("stream callback unavailable")
+            reply = ChatMessage.from_assistant(text="fallback")
+            return SimpleNamespace(
+                replies=(reply,),
+                meta={
+                    "profile": "test",
+                    "profile_version": "1.0.0",
+                    "policy_route": "daily",
+                    "scenario": "daily",
+                    "nodes": [],
+                    "graph_path": ["request", "daily", "response"],
+                    "terminal_node": "response",
+                },
+                state={},
+            )
+
+    monkeypatch.setenv("DATABRICKS_HOST", "https://workspace.example")
+    monkeypatch.setattr(agent_module, "ConfiguredAgentOrchestrator", FakeOrchestrator)
+    agent = Agent(valid_profile())
+
+    events = list(
+        agent.predict_stream(
+            {"input": [{"role": "user", "content": "stream"}], "stream": True, "custom_inputs": {"scenario": "daily"}}
+        )
+    )
+    done_payload = events[-2].model_dump() if callable(getattr(events[-2], "model_dump", None)) else events[-2]
+    completed_payload = events[-1].model_dump() if callable(getattr(events[-1], "model_dump", None)) else events[-1]
+
+    assert done_payload["type"] == "response.output_item.done"
+    assert done_payload["item"]["content"][0]["text"] == "fallback"
+    assert completed_payload["type"] == "response.completed"
+    assert completed_payload["response"]["output"][0]["content"][0]["text"] == "fallback"
 
 
 def test_requirements_pin_managed_mlflow_and_agents():
