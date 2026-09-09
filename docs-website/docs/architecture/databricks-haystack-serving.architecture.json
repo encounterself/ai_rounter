@@ -1,0 +1,214 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Databricks Serving × Haystack Agent 集成架构",
+    "locale": "zh-CN",
+    "subtitle": "当前 ai_rounter：协议入口、智能场景编排、模型路由、会话与完整追踪",
+    "output": "examples/databricks-haystack-serving.architecture.html",
+    "visual_preset": "signal-flow",
+    "animation": "none",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/encounterself/ai_rounter",
+      "provider": "github",
+      "link_mode": "web",
+      "revision": "6882160955182d0751ca64b47b81112d00e86a7c"
+    },
+    "views": [
+      {
+        "id": "request-path",
+        "label": "请求主链路",
+        "focus": ["clients", "serving_endpoint", "responses_agent", "haystack_agent", "model_routes"],
+        "note": "从 Claude/Codex 协议入口进入 Databricks Serving，再由 Haystack Agent 调用模型路由。"
+      },
+      {
+        "id": "orchestration",
+        "label": "智能编排",
+        "focus": ["responses_agent", "scenario_graph", "haystack_agent", "mcp_tools", "model_routes"],
+        "note": "场景选择 writing、coding、daily；coding 固定经过 review → coding。"
+      },
+      {
+        "id": "state-observability",
+        "label": "状态与追踪",
+        "focus": ["responses_agent", "lakebase", "mlflow_trace", "uc_model", "serving_endpoint"],
+        "note": "请求状态通过 Lakebase CAS 持久化，模型版本由 Unity Catalog 管理，链路写入 MLflow。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "clients",
+      "type": "external",
+      "label": "Claude Code / Codex",
+      "sublabel": "Anthropic · Responses · Chat",
+      "pos": [40, 340],
+      "size": [174, 72],
+      "tag": "client"
+    },
+    {
+      "id": "serving_endpoint",
+      "type": "cloud",
+      "label": "Databricks Model Serving",
+      "sublabel": "haystack-agent-router · endpoint",
+      "pos": [270, 340],
+      "size": [190, 72],
+      "tag": "serving"
+    },
+    {
+      "id": "responses_agent",
+      "type": "backend",
+      "label": "MLflow ResponsesAgent runtime",
+      "sublabel": "normalize · stream · trace",
+      "pos": [560, 340],
+      "size": [190, 72],
+      "tag": "deploy/databricks/agent.py",
+      "sources": [
+        {"path": "deploy/databricks/agent.py", "line": 291, "label": "ResponsesAgent"},
+        {"path": "deploy/databricks/serving_runtime.py", "line": 1, "label": "runtime"}
+      ]
+    },
+    {
+      "id": "scenario_graph",
+      "type": "backend",
+      "label": "场景图与智能路由",
+      "sublabel": "writing · review → coding · daily",
+      "pos": [560, 180],
+      "size": [190, 72],
+      "tag": "agent graph"
+    },
+    {
+      "id": "haystack_agent",
+      "type": "backend",
+      "label": "Haystack Agent 编排器",
+      "sublabel": "Agent · ChatGenerator · bindings",
+      "pos": [820, 336],
+      "size": [208, 80],
+      "tag": "Haystack",
+      "sources": [
+        {"path": "integrations/databricks/agent_orchestrator.py", "line": 93, "label": "Agent"},
+        {"path": "integrations/databricks/haystack_chat_generator.py", "line": 1, "label": "ChatGenerator"}
+      ]
+    },
+    {
+      "id": "model_routes",
+      "type": "cloud",
+      "label": "AI Gateway / Serving routes",
+      "sublabel": "Claude · Codex · adapters",
+      "pos": [1100, 336],
+      "size": [224, 80],
+      "tag": "model providers",
+      "sources": [
+        {"path": "integrations/databricks/ai_gateway.py", "line": 1, "label": "route selector"},
+        {"path": "integrations/databricks/serving_endpoints.py", "line": 1, "label": "serving adapter"},
+        {"path": "integrations/databricks/protocols.py", "line": 1, "label": "protocols"}
+      ]
+    },
+    {
+      "id": "mcp_tools",
+      "type": "external",
+      "label": "MCP Toolsets",
+      "sublabel": "streamable HTTP · allowlisted tools",
+      "pos": [820, 180],
+      "size": [208, 72],
+      "tag": "tools",
+      "sources": [
+        {"path": "integrations/databricks/mcp_toolset.py", "line": 1, "label": "MCP toolset"}
+      ]
+    },
+    {
+      "id": "lakebase",
+      "type": "database",
+      "label": "Databricks Lakebase Postgres",
+      "sublabel": "test-ontos · session + CAS",
+      "pos": [543, 600],
+      "size": [224, 78],
+      "tag": "state",
+      "sources": [
+        {"path": "integrations/databricks/session_store.py", "line": 228, "label": "Postgres store"}
+      ]
+    },
+    {
+      "id": "uc_model",
+      "type": "database",
+      "label": "Unity Catalog model",
+      "sublabel": "simo_prod.mysql_cdc_sync",
+      "pos": [247, 600],
+      "size": [236, 78],
+      "tag": "haystack_agent_router model"
+    },
+    {
+      "id": "mlflow_trace",
+      "type": "cloud",
+      "label": "MLflow GenAI tracing",
+      "sublabel": "request → LLM → tool spans",
+      "pos": [817, 600],
+      "size": [214, 78],
+      "tag": "observability",
+      "sources": [
+        {"path": "deploy/databricks/tracing.py", "line": 373, "label": "span factory"},
+        {"path": "deploy/databricks/agent.py", "line": 426, "label": "request trace"}
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Databricks Workspace",
+      "wraps": ["serving_endpoint", "responses_agent", "scenario_graph", "haystack_agent", "model_routes", "lakebase", "uc_model", "mlflow_trace"],
+      "pad": 24
+    },
+    {
+      "kind": "security-group",
+      "label": "haystack-agent-router serving runtime",
+      "wraps": ["responses_agent", "scenario_graph", "haystack_agent"],
+      "pad": 16
+    },
+    {
+      "kind": "security-group",
+      "label": "state and observability services",
+      "wraps": ["lakebase", "mlflow_trace"],
+      "pad": 14
+    }
+  ],
+  "connections": [
+    {"from": "clients", "to": "serving_endpoint", "label": "HTTPS + protocol", "variant": "emphasis", "route": "straight", "fromSide": "right", "toSide": "left", "labelAt": [242, 326]},
+    {"from": "serving_endpoint", "to": "responses_agent", "label": "MLflow serving request", "variant": "emphasis", "labelAt": [510, 326]},
+    {"from": "responses_agent", "to": "haystack_agent", "label": "normalize + orchestrate", "variant": "emphasis", "labelAt": [785, 326]},
+    {"from": "haystack_agent", "to": "model_routes", "label": "Haystack ChatGenerator", "variant": "emphasis", "labelAt": [1064, 326]},
+    {"from": "scenario_graph", "to": "responses_agent", "label": "profile snapshot", "variant": "dashed", "labelAt": [690, 294]},
+    {"from": "haystack_agent", "to": "mcp_tools", "label": "tool discovery / calls", "variant": "dashed", "labelAt": [980, 294]},
+    {"from": "responses_agent", "to": "lakebase", "label": "session load + save / CAS", "variant": "dashed", "labelAt": [720, 510]},
+    {"from": "haystack_agent", "to": "mlflow_trace", "label": "request / LLM / tool spans", "variant": "dashed", "labelAt": [1000, 510]},
+    {"from": "uc_model", "to": "serving_endpoint", "label": "registered model version", "variant": "security", "route": "straight", "fromSide": "top", "toSide": "bottom", "labelAt": [450, 500]}
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "真实请求路径",
+      "items": [
+        "Claude Code、Codex 或其他兼容客户端进入 haystack-agent-router",
+        "MLflow ResponsesAgent 负责请求规范化、响应转换与流式输出",
+        "Haystack Agent 通过 Databricks 路由调用 Claude 或 Codex 模型"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "场景编排",
+      "items": [
+        "writing 绑定 writing prompt、skill 与模型",
+        "coding 先执行 review，再进入 coding worker，并可调用 MCP",
+        "daily 使用独立 prompt、skill、工具与模型绑定"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "状态与证据",
+      "items": [
+        "Lakebase test-ontos 保存会话、agent state 与 revision",
+        "Unity Catalog simo_prod.mysql_cdc_sync 管理可部署模型版本",
+        "MLflow 记录 request、route、LLM、tool、session 的关联 span"
+      ]
+    }
+  ]
+}
