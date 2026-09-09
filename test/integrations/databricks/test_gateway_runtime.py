@@ -24,11 +24,7 @@ def test_databricks_foundation_model_backend_uses_chat_contract() -> None:
                 "object": "chat.completion",
                 "model": "databricks-gpt-5-mini",
                 "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": "smoke-ok"},
-                        "finish_reason": "stop",
-                    }
+                    {"index": 0, "message": {"role": "assistant", "content": "smoke-ok"}, "finish_reason": "stop"}
                 ],
                 "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
             },
@@ -36,18 +32,11 @@ def test_databricks_foundation_model_backend_uses_chat_contract() -> None:
         )
 
     backend = DatabricksFoundationModelBackend(
-        "https://workspace.example",
-        "databricks-gpt-5-mini",
-        transport=httpx.MockTransport(handler),
+        "https://workspace.example", "databricks-gpt-5-mini", transport=httpx.MockTransport(handler)
     )
     try:
         response = backend.invoke(
-            request=InternalRequest(
-                messages=(
-                    InternalMessage(role="user", content="hello"),
-                ),
-                max_tokens=16,
-            ),
+            request=InternalRequest(messages=(InternalMessage(role="user", content="hello"),), max_tokens=16),
             request_id="test-request",
         )
     finally:
@@ -72,11 +61,7 @@ def test_codex_compatible_provider_uses_explicit_http_path_without_shell() -> No
                 "object": "response",
                 "status": "completed",
                 "output": [
-                    {
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": "done"}],
-                    }
+                    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}
                 ],
             },
             request=request,
@@ -84,17 +69,11 @@ def test_codex_compatible_provider_uses_explicit_http_path_without_shell() -> No
 
     transport = httpx.MockTransport(handler)
     backend = OpenAICompatibleBackend(
-        "https://codex.example",
-        api_key="codex-secret",
-        protocol="responses",
-        path="/v1/responses",
-        transport=transport,
+        "https://codex.example", api_key="codex-secret", protocol="responses", path="/v1/responses", transport=transport
     )
     config = GatewayConfig(
         providers=(
-            ModelProvider(
-                "codex", "openai_compatible", base_url="https://codex.example", protocols=("responses",)
-            ),
+            ModelProvider("codex", "openai_compatible", base_url="https://codex.example", protocols=("responses",)),
         ),
         routes=(ModelRoute("codex-route", "codex", "provider/codex", protocols=("responses",)),),
     )
@@ -157,10 +136,7 @@ def test_anthropic_stream_events_are_forwarded_through_internal_envelopes() -> N
             'data: {"type":"message_stop"}\n\n'
         )
         return httpx.Response(
-            200,
-            headers={"content-type": "text/event-stream"},
-            content=body.encode(),
-            request=request,
+            200, headers={"content-type": "text/event-stream"}, content=body.encode(), request=request
         )
 
     backend = AnthropicBackend("https://anthropic.example", transport=httpx.MockTransport(handler))

@@ -1,9 +1,11 @@
-"""Databricks integration helpers for route-based agent serving.
+"""
+Databricks integration helpers for route-based agent serving.
 
 The public helpers are deliberately transport-neutral except for the explicit
 read-only Serving Endpoint client and injected gateway backends.
 """
 
+from .agent_orchestrator import AgentOrchestrationError, ConfiguredAgentOrchestrator, OrchestrationResult
 from .ai_gateway import (
     DraftValidationResult,
     FallbackPolicy,
@@ -32,20 +34,46 @@ from .gateway import (
     OpenAICompatibleBackend,
     RequestContext,
 )
+from .haystack_chat_generator import DatabricksChatGenerator, build_gateway_runtime
+from .mcp_toolset import HttpMcpToolset, McpToolsetError
 from .serving_endpoints import (
     DatabricksServingEndpointsClient,
-    ServingEndpointSummary,
     ServingEndpointsError,
     ServingEndpointsHTTPError,
     ServingEndpointsPayloadError,
     ServingEndpointsTransportError,
+    ServingEndpointSummary,
     ServingEntitySummary,
     ServingOpenAPI,
     summarize_endpoint,
 )
+from .session_store import (
+    InMemorySessionStore,
+    JsonFileSessionStore,
+    PostgresSessionStore,
+    SessionConflictError,
+    SessionSnapshot,
+    SessionStore,
+    SessionStoreError,
+    session_store_from_env,
+)
 
 __all__ = [
     "DatabricksServingEndpointsClient",
+    "DatabricksChatGenerator",
+    "AgentOrchestrationError",
+    "ConfiguredAgentOrchestrator",
+    "OrchestrationResult",
+    "HttpMcpToolset",
+    "McpToolsetError",
+    "InMemorySessionStore",
+    "JsonFileSessionStore",
+    "PostgresSessionStore",
+    "SessionConflictError",
+    "SessionSnapshot",
+    "SessionStore",
+    "SessionStoreError",
+    "session_store_from_env",
     "DatabricksFoundationModelBackend",
     "DatabricksServingBackend",
     "DraftValidationResult",
@@ -78,4 +106,5 @@ __all__ = [
     "resolve_route_reference",
     "summarize_endpoint",
     "validate_gateway_config",
+    "build_gateway_runtime",
 ]

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from deploy.databricks import publish_current_model as publisher
 from deploy.databricks.publish_current_model import (
+    lakebase_resource_name,
     obo_auth_policy,
     profile_secret_refs,
     profile_tracing_environment,
@@ -26,12 +27,10 @@ def test_register_model_returns_this_registration_version_not_latest(monkeypatch
             return None
 
     model_info = SimpleNamespace(
-        model_uri="models:/simo_prod.mysql_cdc_sync.haystack_agent_router/23",
-        registered_model_version="23",
+        model_uri="models:/simo_prod.mysql_cdc_sync.haystack_agent_router/23", registered_model_version="23"
     )
     (tmp_path / "profile.json").write_text(
-        json.dumps({"default_route": "model-services/catalog.schema.default_route"}),
-        encoding="utf-8",
+        json.dumps({"default_route": "model-services/catalog.schema.default_route"}), encoding="utf-8"
     )
     monkeypatch.setattr(
         publisher,
@@ -56,8 +55,24 @@ def test_register_model_returns_this_registration_version_not_latest(monkeypatch
 def test_obo_auth_policy_requests_model_serving_scope():
     assert obo_auth_policy().to_dict() == {
         "system_auth_policy": {},
-        "user_auth_policy": {"api_scopes": ["model-serving"]},
+        "user_auth_policy": {"api_scopes": ["model-serving", "ai-gateway"]},
     }
+
+
+def test_obo_auth_policy_declares_lakebase_as_system_resource():
+    assert obo_auth_policy(lakebase_resource="projects/test-ontos").to_dict() == {
+        "system_auth_policy": {
+            "resources": {
+                "databricks": {"postgres": [{"name": "projects/test-ontos", "database_name": "databricks_postgres"}]},
+                "api_version": "1",
+            }
+        },
+        "user_auth_policy": {"api_scopes": ["model-serving", "ai-gateway"]},
+    }
+
+
+def test_lakebase_resource_name_uses_project_parent():
+    assert lakebase_resource_name("projects/test-ontos/branches/production/endpoints/primary") == "projects/test-ontos"
 
 
 def test_profile_secret_refs_only_reads_reference_strings(tmp_path: Path):
@@ -73,10 +88,7 @@ def test_profile_secret_refs_only_reads_reference_strings(tmp_path: Path):
         ),
         encoding="utf-8",
     )
-    assert profile_secret_refs(profile) == (
-        "{{secrets/oauth/client-id}}",
-        "{{secrets/oauth/client-secret}}",
-    )
+    assert profile_secret_refs(profile) == ("{{secrets/oauth/client-id}}", "{{secrets/oauth/client-secret}}")
 
 
 def test_profile_tracing_environment_uses_databricks_tracking_uri(tmp_path: Path):
@@ -131,11 +143,7 @@ def test_update_endpoint_uses_official_cli(monkeypatch, tmp_path: Path):
     config_path = tmp_path / "update.json"
     config_path.write_text(json.dumps({"served_entities": []}), encoding="utf-8")
 
-    update_endpoint_with_cli(
-        endpoint_name="haystack-agent-router",
-        config_path=config_path,
-        cli_profile="DEFAULT",
-    )
+    update_endpoint_with_cli(endpoint_name="haystack-agent-router", config_path=config_path, cli_profile="DEFAULT")
 
     assert calls == [
         [

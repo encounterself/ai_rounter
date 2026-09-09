@@ -99,15 +99,10 @@ def test_refresh_filters_resources_and_parses_capabilities(model_services_payloa
             )
         model_payload = dict(model_services_payload)
         model_payload["model_services"] = [
-            service
-            for service in model_services_payload["model_services"]
-            if "ai_gateway" not in service["name"]
+            service for service in model_services_payload["model_services"] if "ai_gateway" not in service["name"]
         ]
         return httpx.Response(
-            200,
-            json=model_payload,
-            headers={"ETag": "registry-etag", "Cache-Control": "max-age=60"},
-            request=request,
+            200, json=model_payload, headers={"ETag": "registry-etag", "Cache-Control": "max-age=60"}, request=request
         )
 
     transport = httpx.MockTransport(handler)
@@ -184,7 +179,9 @@ def test_system_ai_services_are_hidden_and_rejected(model_services_payload):
         assert registry.is_user_selectable("model-services/simo_prod.ai_gateway.route_glm")
         assert not registry.is_user_selectable("model-services/simo_prod.ai_gateway.")
         assert not registry.is_user_selectable("model-services/simo_prod.ai_gateway.evil/../../route")
-        assert not registry.is_user_selectable("https://workspace.example/model-services/simo_prod.ai_gateway.route_glm")
+        assert not registry.is_user_selectable(
+            "https://workspace.example/model-services/simo_prod.ai_gateway.route_glm"
+        )
         assert not registry.is_user_selectable("model-services/simo_prod.ai_other.route_test")
         assert not registry.is_user_selectable("model-services/other_prod.ai_models.route_test")
         with pytest.raises(ModelServiceNotAllowedError):

@@ -1,4 +1,5 @@
-"""Read-only helpers for Databricks Model Serving endpoints.
+"""
+Read-only helpers for Databricks Model Serving endpoints.
 
 This module deliberately does not create or update endpoints.  It provides the
 small REST surface needed by a control plane and keeps endpoint payload parsing
@@ -29,13 +30,7 @@ class ServingEndpointsHTTPError(ServingEndpointsError):
     """Raised for an unsuccessful Databricks Serving API response."""
 
     def __init__(
-        self,
-        status_code: int,
-        url: str,
-        body: str = "",
-        *,
-        operation: str = "request",
-        profile: str | None = None,
+        self, status_code: int, url: str, body: str = "", *, operation: str = "request", profile: str | None = None
     ) -> None:
         self.status_code = status_code
         self.url = url
@@ -155,7 +150,8 @@ def summarize_endpoint(payload: Mapping[str, Any]) -> ServingEndpointSummary:
 
 
 class DatabricksServingEndpointsClient:
-    """Read-only Databricks Serving Endpoints REST client.
+    """
+    Read-only Databricks Serving Endpoints REST client.
 
     ``profile`` is intentionally not used to discover credentials.  It is
     retained on errors and summaries so an application can report which
@@ -258,16 +254,11 @@ class DatabricksServingEndpointsClient:
             response = self._client.request(method, path, **kwargs)
         except httpx.RequestError as error:
             raise ServingEndpointsTransportError(
-                f"Databricks Serving Endpoints {operation} could not reach the workspace: "
-                f"{_redact_text(str(error))}"
+                f"Databricks Serving Endpoints {operation} could not reach the workspace: {_redact_text(str(error))}"
             ) from error
         if response.status_code >= 400:
             raise ServingEndpointsHTTPError(
-                response.status_code,
-                str(response.url),
-                response.text,
-                operation=operation,
-                profile=self.profile,
+                response.status_code, str(response.url), response.text, operation=operation, profile=self.profile
             )
         try:
             return response.json()

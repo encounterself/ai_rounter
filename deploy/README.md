@@ -10,9 +10,28 @@ The example profile defaults to `system-ai/databricks-gpt-5-mini`, a direct Data
 
 The example profile also includes `serving-endpoints/databricks-kimi-k3` and `serving-endpoints/databricks-gpt-5-6-luna`. Select one by setting `gateway.route` or `DATABRICKS_MODEL_ROUTE`; route metadata is selected by the route identifier. The `serving-endpoints/<endpoint>` form is equivalent to a `system-ai/<id>` route whose metadata declares the endpoint backend.
 
+### Haystack orchestration profile
+
+Use `deploy/databricks/orchestration.profile.example.json` when the serving model must run the Haystack `Agent` loop instead of a single gateway request. The profile binds scenario policies to model routes and may attach approved prompt bodies, skills, and allowlisted streamable-HTTP MCP servers. `model-services/simo_prod.ai_models.*` and `model-services/simo_prod.ai_gateway.*` are AI Gateway Model Services resources; they are not the Unity Catalog model containing this serving code.
+
+The current registered-model target is `simo_prod.mysql_cdc_sync.haystack_agent_router`. Keep the orchestration profile as the model artifact named `profile`, and provide prompt/skill bodies through the profile or an operator-controlled loader. Do not put provider keys, MCP credentials, or arbitrary Python imports in the profile. `serving-endpoint/<name>` and `serving-endpoints/<name>` model bindings are supported for direct Serving Endpoint routes.
+
+### Session persistence
+
+The serving wrapper restores and saves Haystack conversation messages when requests include `custom_inputs.session_id` (or matching request metadata). Production deployments should use the Lakebase Postgres database `test_ontos` through the endpoint's OAuth identity:
+
+```text
+HAYSTACK_SESSION_LAKEBASE_ENDPOINT=projects/<project>/branches/<branch>/endpoints/<endpoint>
+HAYSTACK_SESSION_DATABASE=test_ontos
+HAYSTACK_SESSION_TABLE=haystack_agent_sessions
+HAYSTACK_SESSION_AUTO_MIGRATE=true
+```
+
+`HAYSTACK_SESSION_AUTO_MIGRATE=true` is intended for an explicitly approved deployment initialization step. With `DATABRICKS_SERVING_USE_WORKLOAD_IDENTITY=true` and no M2M client credentials, the Postgres role must exactly match the serving workload identity returned by `current_user.me().user_name`; do not set `HAYSTACK_SESSION_DATABASE_USER` to an unrelated user's UUID. If sessions must be owned by the invoking user instead, pass `--session-use-user-auth`, omit `HAYSTACK_SESSION_DATABASE_USER`, and grant each invoking identity access to the Lakebase endpoint/database. The store uses tenant/session keys, revision compare-and-swap writes, and redacts authorization/token/secret/password fields before persistence. If no Lakebase endpoint or DSN is configured, the runtime falls back to process-local memory and must not be treated as durable production session storage.
+
 ## Register a new version
 
-1. Use MLflow 3.1+ Managed MLflow and install `deploy/databricks/requirements.txt` (`mlflow>=3.1.0,<4`, `databricks-agents>=1.2.0`) in the build image. Managed MLflow access and the endpoint identity's experiment permissions are operator prerequisites.
+1. Use Managed MLflow and install `deploy/databricks/requirements.txt` (`mlflow>=3.16.0,<4`, `databricks-agents>=1.12.0`) in the build image. Managed MLflow access and the endpoint identity's experiment permissions are operator prerequisites.
 2. Register `Agent` as the MLflow `python_function`/`ResponsesAgent` code-model entrypoint, package `deploy/databricks` as `code_path`, and register a new model version through the operator's normal MLflow flow. The model module calls `mlflow.models.set_model`; this repository does not perform that registration remotely.
 3. Inject `profile.json` as a model artifact named `profile` (or provide equivalent model config). `load_context` validates `default_route` and `route_metadata`; it never falls back to an empty profile.
 4. Configure only non-secret endpoint environment values: `DATABRICKS_WORKSPACE_ID` plus `DATABRICKS_HOST` (or an explicit `DATABRICKS_AI_GATEWAY_BASE_URL`). Do not configure `DATABRICKS_TOKEN`; authentication uses OBO when available, otherwise optional secret-backed OAuth M2M references.
@@ -102,7 +121,7 @@ The production endpoint was not updated because the publisher used a hand-writte
 
 Run these stages in order and stop at the first failure:
 
-1. Build and register a new model version with Managed MLflow, `mlflow>=3.1.0,<4`, and `databricks-agents>=1.2.0`.
+1. Build and register a new model version with Managed MLflow, `mlflow>=3.16.0,<4`, and `databricks-agents>=1.12.0`.
 2. Read back the model version, `MLmodel`, requirements, signature, and registration task logs. Confirm that `agent.py`, `gateway_client.py`, `profile_loader.py`, `serving_runtime.py`, and `tracing.py` are all present in the packaged code path.
 3. Create or use an isolated test endpoint. Poll `state.ready == "READY"` and `state.config_update == "NOT_UPDATING"`, then run both non-streaming and streaming `agent/v1/responses` smoke requests and inspect the returned `error` field.
 4. Only after the test endpoint is healthy, update the production endpoint with a complete `served_entities` and `traffic_config` body. Always pass `--profile DEFAULT`, preserve the current workload/scaling settings, and poll the endpoint again before declaring success.
@@ -112,7 +131,7 @@ Never copy a PAT, provider API key, Claude/Codex credential, or old endpoint tok
 
 ### Tracing beta gate
 
-Tracing is an operator-controlled feature, not a deployment-side switch. Before enabling it, confirm the workspace preview/beta flag, a Managed MLflow experiment with `CAN EDIT`, a SQL warehouse with `CAN USE`, the monitoring job permission, the endpoint identity, and the Unity Catalog trace catalog/schema privileges. The serving image uses `mlflow>=3.1.0,<4`; the separate UC trace-location/operator environment currently requires `mlflow[databricks]>=3.14.0`. `MLFLOW_TRACING_ENABLED`, `beta=true`, and `preview_or_beta=true` are only configuration markers. If any cloud prerequisite is unconfirmed, leave tracing disabled and report the exact missing gate rather than treating the template as enabled.
+Tracing is an operator-controlled feature, not a deployment-side switch. Before enabling it, confirm the workspace preview/beta flag, a Managed MLflow experiment with `CAN EDIT`, a SQL warehouse with `CAN USE`, the monitoring job permission, the endpoint identity, and the Unity Catalog trace catalog/schema privileges. The serving image uses `mlflow>=3.16.0,<4`; the separate UC trace-location/operator environment currently requires `mlflow[databricks]>=3.14.0`. `MLFLOW_TRACING_ENABLED`, `beta=true`, and `preview_or_beta=true` are only configuration markers. If any cloud prerequisite is unconfirmed, leave tracing disabled and report the exact missing gate rather than treating the template as enabled.
 
 The supported UC trace setup uses `from mlflow.entities.trace_location import UnityCatalog`,
 `mlflow.set_tracking_uri("databricks")`, and `trace_location=UnityCatalog(` with a
@@ -132,7 +151,7 @@ The first failed endpoint update was not caused by the endpoint configuration. T
 
 Use this order for every change:
 
-1. Register the model version with MLflow `>=3.1.0` and `databricks-agents>=1.2.0`.
+1. Register the model version with MLflow `>=3.16.0` and `databricks-agents>=1.12.0`.
 2. Validate the model URI, packaged code path, profile, and a non-secret Responses request in an isolated test endpoint.
 3. Inspect the serving endpoint state and logs; only then update the intended endpoint to the validated version.
 
@@ -140,7 +159,7 @@ All Databricks CLI examples must select the profile explicitly, for example `dat
 
 ### GenAI tracing beta
 
-Tracing is deliberately disabled by default. The `monitoring.example.json` file is a checklist, not an activation command. The operator environment needs MLflow `>=3.14.0` with the `databricks` extra, a supported workspace/region with the beta available, an editable Managed MLflow experiment, a Unity Catalog destination, a SQL warehouse, and the required catalog/schema, trace-table, experiment, and monitoring-job permissions. The serving runtime remains pinned to `mlflow>=3.1.0,<4`; do not solve operator-side tracing prerequisites by changing the serving image.
+Tracing is deliberately disabled by default. The `monitoring.example.json` file is a checklist, not an activation command. The operator environment needs MLflow `>=3.14.0` with the `databricks` extra, a supported workspace/region with the beta available, an editable Managed MLflow experiment, a Unity Catalog destination, a SQL warehouse, and the required catalog/schema, trace-table, experiment, and monitoring-job permissions. The serving runtime remains pinned to `mlflow>=3.16.0,<4`; do not solve operator-side tracing prerequisites by changing the serving image.
 
 Known blockers are the beta rollout/region gate, missing Managed MLflow experiment edit permission, unavailable SQL warehouse or monitoring-job permission, and missing Unity Catalog table privileges. Until each confirmation in `monitoring.example.json` is true, keep `enabled` and `trace_enabled` false and treat tracing as a non-blocking diagnostic capability rather than a deployment requirement.
 
@@ -277,7 +296,7 @@ Use the fields shown by that local `patch -h` output, then run `get <TEST_ENDPOI
 
 Tracing is disabled by default: `trace_enabled=false` in the profile/runtime and `MLFLOW_TRACING_ENABLED=false` are the safe defaults. `MLFLOW_TRACE_SAMPLING_RATIO` controls sampling, `MLFLOW_TRACE_CAPTURE_CONTENT` defaults to `false`, `MLFLOW_TRACING_DESTINATION` accepts `<catalog>.<schema>`, and `MLFLOW_TRACING_SQL_WAREHOUSE_ID` is a non-secret warehouse ID. Profile keys under `tracing` map to these values. `MLFLOW_TRACING_ENABLED`, `ENABLE_MLFLOW_TRACING`, `beta=true`, and `preview_or_beta=true` are configuration markers, not proof that a workspace feature, Managed MLflow experiment, SQL warehouse, UC destination, or permissions are enabled. Trace attributes contain correlation/request IDs, model, route, provider, and tool/MCP/skill identifiers or counts; content remains omitted by default and is recursively redacted and length-limited when explicitly enabled.
 
-`mlflow.genai` is used only for GenAI evaluation and scorer/trace APIs; it is not required to serve an invocation. The serving image requirement remains exactly `mlflow>=3.1.0,<4` plus `databricks-agents>=1.2.0`. UC managed trace ingestion is a separate operator environment requirement: independently pin and validate `mlflow[databricks]>=3.14.0` (MLflow Python 3.14+) before enabling a UC trace location. Do not change the serving image requirement to 3.14 merely because the operator notebook needs the newer UC ingestion APIs.
+`mlflow.genai` is used only for GenAI evaluation and scorer/trace APIs; it is not required to serve an invocation. The serving image requirement remains exactly `mlflow>=3.16.0,<4` plus `databricks-agents>=1.12.0`. UC managed trace ingestion is a separate operator environment requirement: independently pin and validate `mlflow[databricks]>=3.14.0` (MLflow Python 3.14+) before enabling a UC trace location. Do not change the serving image requirement to 3.14 merely because the operator notebook needs the newer UC ingestion APIs.
 
 ### UC trace operator setup
 

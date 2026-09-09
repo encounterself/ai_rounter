@@ -5,22 +5,19 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-
 ROOT = Path(__file__).parents[2]
 README = (ROOT / "deploy/README.md").read_text(encoding="utf-8")
-MONITORING = json.loads(
-    (ROOT / "deploy/databricks/monitoring.example.json").read_text(encoding="utf-8")
-)
+MONITORING = json.loads((ROOT / "deploy/databricks/monitoring.example.json").read_text(encoding="utf-8"))
 REQUIREMENTS = (ROOT / "deploy/databricks/requirements.txt").read_text(encoding="utf-8")
 
 
 def test_serving_and_operator_mlflow_version_boundaries_are_explicit():
-    assert "mlflow>=3.1.0,<4" in REQUIREMENTS
-    assert "databricks-agents>=1.2.0" in REQUIREMENTS
-    assert MONITORING["serving_runtime_mlflow"] == ">=3.1.0,<4"
+    assert "mlflow>=3.16.0,<4" in REQUIREMENTS
+    assert "databricks-agents>=1.12.0" in REQUIREMENTS
+    assert MONITORING["serving_runtime_mlflow"] == ">=3.16.0,<4"
     assert MONITORING["minimum_operator_mlflow"] == ">=3.14.0"
     assert MONITORING["operator_requirements"] == "mlflow[databricks]>=3.14.0"
-    assert "serving image remains mlflow>=3.1.0,<4" in MONITORING["requirements_boundary"]
+    assert "serving image remains mlflow>=3.16.0,<4" in MONITORING["requirements_boundary"]
 
 
 def test_trace_defaults_and_preview_marker_are_not_enablement():

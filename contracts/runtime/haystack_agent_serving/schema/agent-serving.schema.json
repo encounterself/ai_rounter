@@ -63,6 +63,46 @@
     },
     "observability": {
       "$ref": "#/$defs/observability"
+    },
+    "tracing": {
+      "$ref": "#/$defs/tracing"
+    },
+    "prompt_sources": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "maxLength": 20000
+      }
+    },
+    "skill_sources": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "maxLength": 50000
+      }
+    },
+    "mcp_endpoints": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^(https://|http://localhost)([^\\s]{0,1023})$"
+      }
+    },
+    "agent_tools": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/agent_tool_binding"
+      },
+      "uniqueItems": true
+    },
+    "state_schema": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/identifier"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/state_field"
+      }
     }
   },
   "$defs": {
@@ -72,7 +112,7 @@
     },
     "logical_ref": {
       "type": "string",
-      "pattern": "^(?!system(?:\\.|$))(?!agent_)(?![a-z][a-z0-9+.-]*://)(?!.*[/\\\\])[a-z][a-z0-9._-]{0,127}$"
+      "pattern": "^(?!system(?:[.-]|$))(?!agent_)(?![a-z][a-z0-9+.-]*://)(?!.*[/\\\\])[a-z][a-z0-9._-]{0,127}$"
     },
     "model_ref": {
       "type": "string",
@@ -85,6 +125,9 @@
         },
         {
           "pattern": "^model-services/simo_prod\\.ai_gateway\\.[a-z0-9][a-z0-9_-]{0,127}$"
+        },
+        {
+          "pattern": "^serving-endpoints?/[A-Za-z0-9][A-Za-z0-9_.-]{0,126}$"
         }
       ]
     },
@@ -199,6 +242,86 @@
         },
         "policy_route": {
           "$ref": "#/$defs/identifier"
+        },
+        "agent_tools": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/identifier"
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "agent_tool_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "node",
+        "description"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "node": {
+          "$ref": "#/$defs/identifier"
+        },
+        "name": {
+          "$ref": "#/$defs/identifier"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "inputs_from_state": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/identifier"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/identifier"
+          }
+        },
+        "outputs_to_state": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/identifier"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["source"],
+              "properties": {
+                "source": {
+                  "type": "string",
+                  "enum": ["last_message", "messages", "step_count", "token_usage", "exit_reason"]
+                },
+                "handler": {
+                  "type": "string",
+                  "enum": ["identity", "string", "message_text"]
+                }
+              }
+          }
+        }
+      }
+    },
+    "state_field": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["string", "str", "integer", "int", "number", "float", "boolean", "bool", "object", "dict", "array", "list"]
+        },
+        "handler": {
+          "type": "string",
+          "enum": ["replace", "append"]
+        },
+        "persist": {
+          "type": "boolean"
         }
       }
     },
@@ -701,7 +824,8 @@
           ]
         },
         "trace_enabled": {
-          "const": false
+          "type": "boolean",
+          "default": false
         },
         "sampling_ratio": {
           "type": "number",
@@ -709,7 +833,8 @@
           "maximum": 1
         },
         "capture_content": {
-          "const": false
+          "type": "boolean",
+          "default": false
         },
         "redaction_policy": {
           "const": "strict"
@@ -722,6 +847,62 @@
         },
         "emit_model_events": {
           "type": "boolean"
+        }
+      }
+    },
+    "tracing": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "experiment_id": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "experiment_name": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "sampling_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "capture_content": {
+          "type": "boolean"
+        },
+        "beta": {
+          "type": "boolean"
+        },
+        "tracking_uri": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "destination": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "sql_warehouse_id": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "uc_catalog": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "uc_schema": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "uc_table": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "uc_volume": {
+          "type": "string",
+          "maxLength": 512
         }
       }
     },

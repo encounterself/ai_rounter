@@ -771,9 +771,7 @@ _PROTOCOL_CAPABILITIES: dict[str, ProtocolCapability] = {
     PROTOCOL_ANTHROPIC_MESSAGES: ProtocolCapability(
         PROTOCOL_ANTHROPIC_MESSAGES, claude=True, provider_family="anthropic"
     ),
-    PROTOCOL_CURSOR_CHAT: ProtocolCapability(
-        PROTOCOL_CURSOR_CHAT, provider_family="cursor", codex_compatible=False
-    ),
+    PROTOCOL_CURSOR_CHAT: ProtocolCapability(PROTOCOL_CURSOR_CHAT, provider_family="cursor", codex_compatible=False),
 }
 
 
@@ -1009,6 +1007,8 @@ def _render_response_tool(tool: InternalTool) -> dict[str, Any]:
 
 def _parse_anthropic_message(value: Any) -> InternalMessage:
     payload = _mapping(value, "message")
+    if isinstance(payload.get("content"), str):
+        return InternalMessage(role=_string(payload.get("role")) or "user", content=payload["content"])
     text_parts: list[str] = []
     tool_calls: list[InternalToolCall] = []
     tool_call_id: str | None = None

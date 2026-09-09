@@ -19,13 +19,20 @@ for source in dbutils.fs.ls(source_root):
 sys.path.insert(0, str(local_root))
 sys.argv = [
     str(local_root / "publish_current_model.py"),
-    "--deploy-dir", str(local_root),
-    "--profile", str(local_root / "profile.example.json"),
-    "--model-name", "simo_prod.mysql_cdc_sync.haystack_agent_router",
-    "--endpoint-name", "haystack-agent-router",
-    "--workspace-id", "3761760657895016",
-    "--workspace-host", "https://dbc-b21ff395-726b.cloud.databricks.com",
-    "--owner", "dean.he@simo.co",
+    "--deploy-dir",
+    str(local_root),
+    "--profile",
+    str(local_root / "profile.example.json"),
+    "--model-name",
+    "simo_prod.mysql_cdc_sync.haystack_agent_router",
+    "--endpoint-name",
+    "haystack-agent-router",
+    "--workspace-id",
+    "3761760657895016",
+    "--workspace-host",
+    "https://dbc-b21ff395-726b.cloud.databricks.com",
+    "--owner",
+    "dean.he@simo.co",
 ]
 captured = io.StringIO()
 with contextlib.redirect_stdout(captured):

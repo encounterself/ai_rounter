@@ -16,7 +16,7 @@ except ImportError:  # MLflow code_path loads modules without the package prefix
 class LocalServingRuntime:
     """Execute one normalized request and return a response-shaped mapping."""
 
-    def __init__(self, gateway: GatewayClient, tracing: TracingConfig | None = None):
+    def __init__(self, gateway: GatewayClient, tracing: TracingConfig | None = None) -> None:
         self.gateway = gateway
         self.tracing = tracing or TracingConfig.from_env()
 
@@ -33,6 +33,15 @@ class LocalServingRuntime:
             model=request.get("model") or metadata.get("model"),
             route=str(route),
             provider=metadata.get("provider"),
+            session_id=request.get("session_id"),
+            turn_id=request.get("turn_id"),
+            user_id=request.get("user_id"),
+            tenant_id=request.get("tenant_id"),
+            scenario=request.get("scenario"),
+            agent_profile=request.get("agent_profile"),
+            protocol=metadata.get("protocol") or self.gateway.settings.protocol,
+            endpoint_name=metadata.get("endpoint"),
+            streamed=bool(request.get("stream", False)),
             metadata=metadata,
             payload=request.get("payload"),
         )
@@ -48,9 +57,9 @@ class LocalServingRuntime:
             if isinstance(result, Iterator):
                 return self._trace_stream(result, span, correlation_id, route)
             if isinstance(result, Mapping) and result.get("status") == "failed":
-                span.finish(error=result.get("error", {}))
+                span.finish(error=result.get("error", {}), attributes=_result_trace_attributes(result))
             else:
-                span.finish()
+                span.finish(attributes=_result_trace_attributes(result))
             return dict(result)
         except GatewayError as exc:
             diagnostic = safe_error(
@@ -67,7 +76,7 @@ class LocalServingRuntime:
                 error_code=exc.diagnostic.get("error_code"),
             )
             diagnostic.update(exc.diagnostic)
-            span.finish(error=diagnostic)
+            span.finish(error=diagnostic, attributes={"http_status": diagnostic.get("http_status")})
             return {"status": "failed", "error": diagnostic}
         except Exception as exc:
             diagnostic = safe_error(
@@ -86,15 +95,13 @@ class LocalServingRuntime:
             return {"status": "failed", "error": diagnostic}
 
     def _trace_stream(
-        self,
-        result: Iterator[dict[str, Any]],
-        span: Any,
-        correlation_id: str,
-        route: Any,
+        self, result: Iterator[dict[str, Any]], span: Any, correlation_id: str, route: Any
     ) -> Iterator[dict[str, Any]]:
         error: Mapping[str, Any] | None = None
         try:
-            yield from result
+            for item in result:
+                span.mark_first_token()
+                yield item
         except GatewayError as exc:
             error = exc.diagnostic
             raise
@@ -114,3 +121,31 @@ class LocalServingRuntime:
             raise
         finally:
             span.finish(error=error)
+
+
+def _result_trace_attributes(result: Mapping[str, Any]) -> dict[str, Any]:
+    usage = result.get("usage") if isinstance(result, Mapping) else None
+    if not isinstance(usage, Mapping):
+        choices = result.get("choices") if isinstance(result, Mapping) else None
+        if isinstance(choices, list) and choices and isinstance(choices[0], Mapping):
+            usage = choices[0].get("usage")
+    if not isinstance(usage, Mapping):
+        usage = {}
+    choices = result.get("choices") if isinstance(result, Mapping) else None
+    first_choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], Mapping) else {}
+    input_details = usage.get("input_tokens_details")
+    output_details = usage.get("output_tokens_details")
+    if not isinstance(input_details, Mapping):
+        input_details = {}
+    if not isinstance(output_details, Mapping):
+        output_details = {}
+    return {
+        "response_id": result.get("id") if isinstance(result, Mapping) else None,
+        "input_tokens": usage.get("prompt_tokens", usage.get("input_tokens")),
+        "output_tokens": usage.get("completion_tokens", usage.get("output_tokens")),
+        "total_tokens": usage.get("total_tokens"),
+        "reasoning_tokens": usage.get("reasoning_tokens", output_details.get("reasoning_tokens")),
+        "cached_tokens": usage.get("cached_tokens", input_details.get("cached_tokens")),
+        "finish_reason": first_choice.get("finish_reason"),
+        "status": result.get("status") if isinstance(result, Mapping) else None,
+    }

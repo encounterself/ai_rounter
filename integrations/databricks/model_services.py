@@ -15,10 +15,7 @@ import httpx
 MODEL_SERVICES_PATH = "/api/2.1/unity-catalog/model-services"
 DEFAULT_ALLOWED_RESOURCE_PREFIX = "model-services/simo_prod.ai_models.route_"
 DEFAULT_ALLOWED_MODEL_SERVICE_PREFIX = DEFAULT_ALLOWED_RESOURCE_PREFIX
-DEFAULT_ALLOWED_RESOURCE_PREFIXES = (
-    DEFAULT_ALLOWED_RESOURCE_PREFIX,
-    "model-services/simo_prod.ai_gateway.",
-)
+DEFAULT_ALLOWED_RESOURCE_PREFIXES = (DEFAULT_ALLOWED_RESOURCE_PREFIX, "model-services/simo_prod.ai_gateway.")
 DEFAULT_ALLOWED_MODEL_SERVICE_PREFIXES = DEFAULT_ALLOWED_RESOURCE_PREFIXES
 DEFAULT_PARENT = "schemas/simo_prod.ai_models"
 DEFAULT_PARENTS = (DEFAULT_PARENT, "schemas/simo_prod.ai_gateway")
@@ -404,8 +401,7 @@ class DatabricksModelServiceRegistry:
         if not normalized_name or SYSTEM_AI_PREFIX in normalized_name:
             return False
         return any(
-            normalized_name.startswith(prefix)
-            and bool(_RESOURCE_SUFFIX_RE.fullmatch(normalized_name[len(prefix) :]))
+            normalized_name.startswith(prefix) and bool(_RESOURCE_SUFFIX_RE.fullmatch(normalized_name[len(prefix) :]))
             for prefix in self.allowed_resource_prefixes
         )
 

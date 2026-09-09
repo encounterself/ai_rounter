@@ -1,0 +1,12 @@
+---
+features:
+  - |
+    Add a profile-driven Haystack Agent integration for Databricks Model Serving and AI Gateway routes, including protocol-aware chat generation, multi-model scenario orchestration, prompt and skill bindings, and allowlisted streamable HTTP MCP toolsets.
+  - |
+    Add revisioned in-memory, JSON-file, and Postgres session stores with tenant isolation, compare-and-swap writes, and credential redaction for serving conversations.
+enhancements:
+  - |
+    Support direct `serving-endpoint/<name>` and `serving-endpoints/<name>` model bindings, OpenAI Responses payloads, streaming callbacks, and richer serving trace attributes.
+security:
+  - |
+    Keep prompt content capture disabled by default, reject unsafe model/resource references, enforce MCP endpoint allowlists, and redact credentials before session persistence or trace emission.

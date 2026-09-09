@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import json
 import importlib.util
+import json
 import os
 import sys
+import threading
 from collections.abc import Mapping
 from types import ModuleType, SimpleNamespace
 
@@ -11,6 +12,7 @@ import httpx
 import pytest
 
 import deploy.databricks.agent as agent_module
+from contracts.runtime.haystack_agent_serving.tests.test_loader import valid_profile
 from deploy.databricks.agent import Agent, normalize_request
 from deploy.databricks.gateway_client import (
     ConfigurationError,
@@ -26,7 +28,7 @@ from deploy.databricks.gateway_client import (
 from deploy.databricks.profile_loader import ProfileError, validate_profile
 from deploy.databricks.serving_runtime import LocalServingRuntime
 from deploy.databricks.tracing import TracingConfig, redact
-
+from haystack.dataclasses import ChatMessage
 
 ROUTE = "model-services/simo_prod.ai_models.route_test"
 METADATA = {"provider": "test", "model": "test-model", "enabled": True}
@@ -56,10 +58,7 @@ def test_gateway_settings_require_base_url_or_workspace_id(monkeypatch):
     with pytest.raises(ConfigurationError) as raised:
         GatewaySettings.from_env()
     assert raised.value.diagnostic["error_code"] == "missing_gateway_base_url"
-    assert raised.value.diagnostic["missing"] == [
-        "DATABRICKS_AI_GATEWAY_BASE_URL",
-        "DATABRICKS_HOST",
-    ]
+    assert raised.value.diagnostic["missing"] == ["DATABRICKS_AI_GATEWAY_BASE_URL", "DATABRICKS_HOST"]
 
 
 def make_client(handler, *, auth=None, allowed_routes=()):
@@ -86,8 +85,7 @@ def test_route_allowlist_and_metadata_are_enforced():
         client.invoke({"input": []}, metadata=None)
     assert no_metadata.value.diagnostic["error_code"] == "route_metadata_missing"
     approved = make_client(
-        lambda request: httpx.Response(200, json={"output": []}, request=request),
-        allowed_routes=("approved",),
+        lambda request: httpx.Response(200, json={"output": []}, request=request), allowed_routes=("approved",)
     )
     approved.validate_route("approved", METADATA)
 
@@ -108,9 +106,7 @@ def test_system_ai_route_uses_workspace_serving_endpoint_without_model_service_g
         protocol="responses",
     )
     client = GatewayClient(
-        settings,
-        auth=ManagedAuth(lambda: {}),
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        settings, auth=ManagedAuth(dict), client=httpx.Client(transport=httpx.MockTransport(handler))
     )
     metadata = {
         "backend": "databricks_serving",
@@ -120,16 +116,11 @@ def test_system_ai_route_uses_workspace_serving_endpoint_without_model_service_g
     }
 
     response = client.invoke(
-        {"input": [{"role": "user", "content": "hello"}]},
-        route="system-ai/databricks-gpt-5-mini",
-        metadata=metadata,
+        {"input": [{"role": "user", "content": "hello"}]}, route="system-ai/databricks-gpt-5-mini", metadata=metadata
     )
 
     assert seen["url"] == "https://workspace.example/serving-endpoints/databricks-gpt-5-mini/invocations"
-    assert seen["body"] == {
-        "messages": [{"role": "user", "content": "hello"}],
-        "stream": False,
-    }
+    assert seen["body"] == {"messages": [{"role": "user", "content": "hello"}], "stream": False}
     assert response["choices"][0]["message"]["content"] == "ok"
 
 
@@ -148,40 +139,26 @@ def test_serving_endpoint_route_derives_endpoint_and_defaults_to_chat():
         route="serving-endpoints/databricks-kimi-k3",
     )
     client = GatewayClient(
-        settings,
-        auth=ManagedAuth(lambda: {}),
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        settings, auth=ManagedAuth(dict), client=httpx.Client(transport=httpx.MockTransport(handler))
     )
 
     response = client.invoke(
-        {"input": [{"role": "user", "content": "hello"}]},
-        route="serving-endpoints/databricks-kimi-k3",
-        metadata={},
+        {"input": [{"role": "user", "content": "hello"}]}, route="serving-endpoints/databricks-kimi-k3", metadata={}
     )
 
     assert seen["url"] == "https://workspace.example/serving-endpoints/databricks-kimi-k3/invocations"
-    assert seen["body"] == {
-        "messages": [{"role": "user", "content": "hello"}],
-        "stream": False,
-    }
+    assert seen["body"] == {"messages": [{"role": "user", "content": "hello"}], "stream": False}
     assert response["choices"][0]["message"]["content"] == "ok"
 
 
 def test_system_ai_profile_metadata_requires_serving_endpoint_and_chat_protocol():
     valid = {
         "default_route": "system-ai/databricks-gpt-5-mini",
-        "route_metadata": {
-            "backend": "databricks_serving",
-            "endpoint": "databricks-gpt-5-mini",
-            "protocol": "chat",
-        },
+        "route_metadata": {"backend": "databricks_serving", "endpoint": "databricks-gpt-5-mini", "protocol": "chat"},
     }
     validate_profile(valid)
 
-    invalid = {
-        **valid,
-        "route_metadata": {"backend": "databricks_serving", "protocol": "responses"},
-    }
+    invalid = {**valid, "route_metadata": {"backend": "databricks_serving", "protocol": "responses"}}
     with pytest.raises(ProfileError) as raised:
         validate_profile(invalid)
     assert raised.value.code == "serving_endpoint_invalid"
@@ -197,9 +174,7 @@ def test_system_ai_profile_metadata_requires_serving_endpoint_and_chat_protocol(
 def test_http_errors_preserve_safe_diagnostics(status):
     def handler(request):
         return httpx.Response(
-            status,
-            json={"error": {"code": "upstream_code", "message": "do not copy"}},
-            request=request,
+            status, json={"error": {"code": "upstream_code", "message": "do not copy"}}, request=request
         )
 
     client = make_client(handler)
@@ -229,8 +204,7 @@ def test_managed_auth_failure_is_not_silent():
         raise RuntimeError("token should not be exposed")
 
     client = make_client(
-        lambda request: httpx.Response(200, json={"output": []}, request=request),
-        auth=ManagedAuth(broken_auth),
+        lambda request: httpx.Response(200, json={"output": []}, request=request), auth=ManagedAuth(broken_auth)
     )
     with pytest.raises(GatewayError) as raised:
         client.invoke({"input": []}, metadata=METADATA)
@@ -307,6 +281,33 @@ def test_managed_auth_uses_model_serving_strategy(monkeypatch):
     assert calls[1] == "authenticate"
 
 
+def test_managed_auth_uses_serving_workload_identity(monkeypatch):
+    monkeypatch.setenv("IS_IN_DATABRICKS_MODEL_SERVING_ENV", "true")
+    monkeypatch.setenv("DATABRICKS_SERVING_USE_WORKLOAD_IDENTITY", "true")
+    calls = []
+
+    class Config:
+        def authenticate(self):
+            calls.append("authenticate")
+            return {"Authorization": "Bearer managed"}
+
+    class WorkspaceClient:
+        config = Config()
+
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+    sdk_module = ModuleType("databricks.sdk")
+    sdk_module.WorkspaceClient = WorkspaceClient
+    databricks_module = ModuleType("databricks")
+    databricks_module.sdk = sdk_module
+    monkeypatch.setitem(sys.modules, "databricks", databricks_module)
+    monkeypatch.setitem(sys.modules, "databricks.sdk", sdk_module)
+
+    assert ManagedAuth().headers() == {"Authorization": "Bearer managed"}
+    assert calls == [{}, "authenticate"]
+
+
 def test_managed_auth_prefers_serving_m2m_environment(monkeypatch):
     monkeypatch.setenv("IS_IN_DB_MODEL_SERVING_ENV", "true")
     monkeypatch.setenv("DATABRICKS_CLIENT_ID", "injected-client-id")
@@ -360,22 +361,22 @@ def test_runtime_and_agent_copy_error_fields_without_prompt_or_secret(monkeypatc
     monkeypatch.setenv("DATABRICKS_AI_GATEWAY_BASE_URL", "https://gateway.example")
     client = make_client(lambda request: httpx.Response(429, json={"error": {"code": "rate_limited"}}, request=request))
     runtime = LocalServingRuntime(client)
-    result = runtime._execute({
-        "payload": {"input": [{"role": "user", "content": "secret prompt"}]},
-        "route": ROUTE,
-        "route_metadata": METADATA,
-        "correlation_id": "corr-1",
-    })
+    result = runtime._execute(
+        {
+            "payload": {"input": [{"role": "user", "content": "secret prompt"}]},
+            "route": ROUTE,
+            "route_metadata": METADATA,
+            "correlation_id": "corr-1",
+        }
+    )
     assert result["status"] == "failed"
     assert result["error"]["correlation_id"] == "corr-1"
     assert result["error"]["http_status"] == 429
     assert "secret prompt" not in json.dumps(result)
 
-    agent = Agent({
-        "default_route": ROUTE,
-        "route_metadata": METADATA,
-        "gateway": {"base_url": "https://gateway.example"},
-    })
+    agent = Agent(
+        {"default_route": ROUTE, "route_metadata": METADATA, "gateway": {"base_url": "https://gateway.example"}}
+    )
     agent.runtime = runtime
     response = agent.predict({"input": [{"role": "user", "content": "secret prompt"}], "stream": False})
     response_data = response if isinstance(response, Mapping) else response.model_dump()
@@ -386,15 +387,9 @@ def test_runtime_and_agent_copy_error_fields_without_prompt_or_secret(monkeypatc
 
 
 def test_responses_normalization_and_streaming_error():
-    assert normalize_request({"input": "Hello!", "stream": False})["input"] == [
-        {"role": "user", "content": "Hello!"}
-    ]
+    assert normalize_request({"input": "Hello!", "stream": False})["input"] == [{"role": "user", "content": "Hello!"}]
     client = make_client(
-        lambda request: httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": "Hi"}}]},
-            request=request,
-        )
+        lambda request: httpx.Response(200, json={"choices": [{"message": {"content": "Hi"}}]}, request=request)
     )
     response = client.invoke({"input": [{"role": "user", "content": "Hello!"}]}, metadata=METADATA)
     assert response["choices"][0]["message"]["content"] == "Hi"
@@ -419,9 +414,7 @@ def test_chat_gateway_explicitly_converts_responses_input():
 
     settings = GatewaySettings("workspace-id", "https://gateway.example", ROUTE, protocol="chat")
     client = GatewayClient(
-        settings,
-        auth=ManagedAuth(lambda: {}),
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        settings, auth=ManagedAuth(dict), client=httpx.Client(transport=httpx.MockTransport(handler))
     )
     client.invoke({"input": [{"role": "user", "content": "Hello"}]}, metadata=METADATA)
     assert seen["path"] == "/chat/completions"
@@ -440,9 +433,7 @@ def test_responses_gateway_sends_model_service_name_without_route_prefix():
 
     settings = GatewaySettings("workspace-id", "https://gateway.example/ai-gateway/mlflow/v1", ROUTE)
     client = GatewayClient(
-        settings,
-        auth=ManagedAuth(lambda: {}),
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        settings, auth=ManagedAuth(dict), client=httpx.Client(transport=httpx.MockTransport(handler))
     )
     client.invoke({"input": [{"role": "user", "content": "Hello"}]}, metadata=METADATA)
     assert seen["path"] == "/ai-gateway/mlflow/v1/responses"
@@ -460,19 +451,34 @@ def test_agent_load_context_requires_profile_and_loads_artifact(monkeypatch, tmp
     assert agent.profile["default_route"] == ROUTE
 
 
-def test_responses_request_object_is_supported():
-    request = SimpleNamespace(
-        input="Hello",
-        stream=False,
-        model="route-model",
-        correlation_id="corr-object",
+def test_agent_load_context_accepts_haystack_orchestration_artifact(monkeypatch):
+    monkeypatch.setenv("DATABRICKS_HOST", "https://workspace.example")
+    agent = Agent()
+
+    agent.load_context(
+        SimpleNamespace(
+            artifacts={"profile": "deploy/databricks/orchestration.profile.example.json"}, model_config=None
+        )
     )
+
+    assert agent.orchestrator is not None
+    assert agent.profile["schema_version"] == "1.0"
+
+
+def test_responses_request_object_is_supported():
+    request = SimpleNamespace(input="Hello", stream=False, model="route-model", correlation_id="corr-object")
     normalized = normalize_request(request)
     assert normalized == {
         "input": [{"role": "user", "content": "Hello"}],
         "stream": False,
         "model": "route-model",
         "metadata": {},
+        "custom_inputs": {},
+        "session_id": None,
+        "turn_id": normalized["turn_id"],
+        "tenant_id": "default",
+        "user_id": None,
+        "scenario": "daily",
         "correlation_id": "corr-object",
         "request_id": None,
     }
@@ -500,11 +506,13 @@ def test_agent_uses_requested_route_metadata(monkeypatch):
         _execute=invoke,
         gateway=SimpleNamespace(settings=SimpleNamespace(protocol="responses", base_url="https://gateway.example")),
     )
-    agent.predict({
-        "input": [{"role": "user", "content": "Hello"}],
-        "custom_inputs": {"model": "model-services/simo_prod.ai_models.route_gpt-5-5"},
-        "stream": False,
-    })
+    agent.predict(
+        {
+            "input": [{"role": "user", "content": "Hello"}],
+            "custom_inputs": {"model": "model-services/simo_prod.ai_models.route_gpt-5-5"},
+            "stream": False,
+        }
+    )
     assert seen == {
         "route": "model-services/simo_prod.ai_models.route_gpt-5-5",
         "metadata": {"enabled": True, "provider": "openai"},
@@ -534,7 +542,9 @@ def test_top_level_agent_loading_imports_siblings_without_sys_path(monkeypatch):
 
 
 def test_offline_stream_events_are_responses_events():
-    agent = Agent({"default_route": ROUTE, "route_metadata": METADATA, "gateway": {"base_url": "https://gateway.example"}})
+    agent = Agent(
+        {"default_route": ROUTE, "route_metadata": METADATA, "gateway": {"base_url": "https://gateway.example"}}
+    )
 
     class Runtime:
         gateway = SimpleNamespace(settings=SimpleNamespace(protocol="responses", base_url="https://gateway.example"))
@@ -549,8 +559,116 @@ def test_offline_stream_events_are_responses_events():
     assert all(event_type.startswith("response.") for event_type in event_types)
 
 
+def test_streaming_request_persists_assistant_output():
+    agent = Agent(
+        {"default_route": ROUTE, "route_metadata": METADATA, "gateway": {"base_url": "https://gateway.example"}}
+    )
+
+    class Runtime:
+        gateway = SimpleNamespace(settings=SimpleNamespace(protocol="responses", base_url="https://gateway.example"))
+
+        def _execute(self, _request):
+            return iter([{"type": "response.output_text.delta", "delta": "Hi"}])
+
+    agent.runtime = Runtime()
+    list(
+        agent.predict_stream(
+            {
+                "input": [{"role": "user", "content": "hello"}],
+                "stream": True,
+                "custom_inputs": {"session_id": "stream-session", "tenant_id": "tenant-1"},
+            }
+        )
+    )
+    snapshot = agent.session_store.load("stream-session", "tenant-1")
+
+    assert snapshot is not None
+    assert snapshot.state["messages"][-1] == {"role": "assistant", "content": "Hi"}  # type: ignore[index]
+
+
+def test_full_orchestration_profile_runs_through_agent_and_persists_session(monkeypatch):
+    calls = []
+
+    class FakeOrchestrator:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def run(self, messages, *, request=None, streaming_callback=None):
+            calls.append((messages, request))
+            if streaming_callback:
+                streaming_callback(SimpleNamespace(content="streamed"))
+            reply = ChatMessage.from_assistant(text="orchestrated")
+            return SimpleNamespace(replies=(reply,), meta={"profile": "test"})
+
+    monkeypatch.setenv("DATABRICKS_HOST", "https://workspace.example")
+    monkeypatch.setattr(agent_module, "ConfiguredAgentOrchestrator", FakeOrchestrator)
+    agent = Agent(valid_profile())
+
+    first = agent.predict(
+        {
+            "input": [{"role": "user", "content": "first"}],
+            "custom_inputs": {"session_id": "session-1", "tenant_id": "tenant-1", "scenario": "daily"},
+        }
+    )
+    second = agent.predict(
+        {
+            "input": [{"role": "user", "content": "second"}],
+            "custom_inputs": {"session_id": "session-1", "tenant_id": "tenant-1", "scenario": "daily"},
+        }
+    )
+
+    first_payload = first.model_dump() if callable(getattr(first, "model_dump", None)) else first
+    second_payload = second.model_dump() if callable(getattr(second, "model_dump", None)) else second
+    assert first_payload["custom_outputs"]["orchestration"]["profile"] == "test"
+    assert second_payload["output"][0]["content"][0]["text"] == "orchestrated"
+    assert len(calls) == 2
+    assert len(calls[1][0]) == 3
+
+
+def test_orchestrated_stream_yields_before_agent_finishes(monkeypatch):
+    consumed = threading.Event()
+
+    class Chunk:
+        @property
+        def content(self):
+            consumed.set()
+            return "first"
+
+    class FakeOrchestrator:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def run(self, messages, *, request=None, streaming_callback=None, state=None):
+            assert streaming_callback is not None
+            streaming_callback(Chunk())
+            if not consumed.wait(timeout=0.5):
+                raise AssertionError("stream chunk was buffered until orchestration completed")
+            reply = ChatMessage.from_assistant(text="complete")
+            return SimpleNamespace(replies=(reply,), meta={"profile": "test"}, state={})
+
+    monkeypatch.setenv("DATABRICKS_HOST", "https://workspace.example")
+    monkeypatch.setattr(agent_module, "ConfiguredAgentOrchestrator", FakeOrchestrator)
+    agent = Agent(valid_profile())
+
+    stream = agent.predict_stream(
+        {
+            "input": [{"role": "user", "content": "stream"}],
+            "stream": True,
+            "custom_inputs": {"scenario": "daily"},
+        }
+    )
+    first = next(stream)
+    first_payload = first.model_dump() if callable(getattr(first, "model_dump", None)) else first
+
+    assert first_payload["type"] == "response.output_text.delta"
+    assert first_payload["delta"] == "first"
+    rest = list(stream)
+    assert rest
+
+
 def test_requirements_pin_managed_mlflow_and_agents():
-    requirements = open("deploy/databricks/requirements.txt", encoding="utf-8").read()
+    with open("deploy/databricks/requirements.txt", encoding="utf-8") as requirements_file:
+        requirements = requirements_file.read()
     assert "mlflow>=3.16.0,<4" in requirements
     assert "databricks-agents>=1.12.0" in requirements
     assert "databricks-ai-bridge>=0.21.0" in requirements
@@ -572,6 +690,22 @@ def test_tracing_destination_and_warehouse_are_read_from_environment(monkeypatch
     assert config.sql_warehouse_id == "warehouse-1"
 
 
+def test_legacy_enable_mlflow_tracing_flag_enables_runtime_spans(monkeypatch):
+    monkeypatch.delenv("MLFLOW_TRACING_ENABLED", raising=False)
+    monkeypatch.setenv("ENABLE_MLFLOW_TRACING", "true")
+
+    assert TracingConfig.from_env().enabled is True
+
+
+def test_orchestration_observability_maps_to_tracing_config():
+    config = TracingConfig.from_env(
+        {"observability": {"trace_enabled": True, "sampling_ratio": 0.25, "capture_content": False}}
+    )
+    assert config.enabled is True
+    assert config.sampling_ratio == 0.25
+    assert config.capture_content is False
+
+
 def test_tracing_profile_destination_maps_to_runtime_environment(monkeypatch):
     monkeypatch.setenv("MLFLOW_TRACING_DESTINATION", "")
     monkeypatch.setenv("MLFLOW_TRACING_SQL_WAREHOUSE_ID", "")
@@ -579,21 +713,18 @@ def test_tracing_profile_destination_maps_to_runtime_environment(monkeypatch):
     monkeypatch.setitem(sys.modules, "mlflow", SimpleNamespace(start_span=lambda **_kwargs: fake_span))
     from deploy.databricks.tracing import start_span
 
-    config = TracingConfig.from_env({
-        "tracing": {
-            "enabled": True,
-            "sampling_ratio": 1.0,
-            "destination": "profile_catalog.profile_schema",
-            "sql_warehouse_id": "profile-warehouse",
+    config = TracingConfig.from_env(
+        {
+            "tracing": {
+                "enabled": True,
+                "sampling_ratio": 1.0,
+                "destination": "profile_catalog.profile_schema",
+                "sql_warehouse_id": "profile-warehouse",
+            }
         }
-    })
+    )
     with start_span(
-        config,
-        correlation_id="corr-profile",
-        request_id="req-profile",
-        model="model",
-        route=ROUTE,
-        provider="provider",
+        config, correlation_id="corr-profile", request_id="req-profile", model="model", route=ROUTE, provider="provider"
     ):
         pass
     assert os.environ["MLFLOW_TRACING_DESTINATION"] == "profile_catalog.profile_schema"
@@ -637,7 +768,12 @@ class _FakeSpan:
 
 def test_tracing_enabled_records_safe_dimensions_and_error(monkeypatch):
     fake_span = _FakeSpan()
-    fake_mlflow = SimpleNamespace(start_span=lambda **_kwargs: fake_span)
+    trace_metadata = []
+
+    def update_current_trace(**kwargs):
+        trace_metadata.append(kwargs)
+
+    fake_mlflow = SimpleNamespace(start_span=lambda **_kwargs: fake_span, update_current_trace=update_current_trace)
     monkeypatch.setitem(sys.modules, "mlflow", fake_mlflow)
     config = TracingConfig(enabled=True, sampling_ratio=1.0, capture_content=False)
     from deploy.databricks.tracing import start_span
@@ -649,6 +785,8 @@ def test_tracing_enabled_records_safe_dimensions_and_error(monkeypatch):
         model="model-1",
         route=ROUTE,
         provider="provider-1",
+        session_id="session-1",
+        user_id="user-1",
         metadata={
             "mcp_binding": "mcp-1",
             "skill_binding": "skill-1",
@@ -671,6 +809,18 @@ def test_tracing_enabled_records_safe_dimensions_and_error(monkeypatch):
     assert fake_span.attributes["error.error_code"] == "bad"
     assert all(not isinstance(value, (dict, list)) for value in fake_span.attributes.values())
     assert not fake_span.record_exception_called
+    metadata = trace_metadata[-1]["metadata"]
+    assert metadata["mlflow.trace.session"] == "session-1"
+    assert metadata["mlflow.trace.user"] == "user-1"
+    assert metadata["haystack.correlation_id"] == "corr-1"
+    assert metadata["haystack.request_id"] == "req-1"
+    assert metadata["haystack.model"] == "model-1"
+    assert metadata["haystack.provider"] == "provider-1"
+    assert metadata["haystack.mcp_binding"].startswith("sha256:")
+    assert metadata["haystack.skill_binding"].startswith("sha256:")
+    assert metadata["haystack.tool_count"] == "2"
+    assert metadata["haystack.route"] == ROUTE
+    assert metadata["haystack.status"] == "error"
 
 
 def test_span_ends_when_attribute_write_fails(monkeypatch):
@@ -744,6 +894,7 @@ def test_runtime_closes_enabled_spans_for_success_and_stream_error(monkeypatch):
 
         def invoke(self, _payload, **kwargs):
             if kwargs["stream"]:
+
                 def stream():
                     yield {"type": "response.output_text.delta", "delta": "Hi"}
                     raise RuntimeError("secret prompt must not be traced")
@@ -753,7 +904,9 @@ def test_runtime_closes_enabled_spans_for_success_and_stream_error(monkeypatch):
 
     runtime = LocalServingRuntime(Gateway(), TracingConfig(enabled=True, sampling_ratio=1.0))
     assert runtime._execute({"payload": {"input": "secret"}, "route": ROUTE, "route_metadata": METADATA})
-    stream = runtime._execute({"payload": {"input": "secret"}, "stream": True, "route": ROUTE, "route_metadata": METADATA})
+    stream = runtime._execute(
+        {"payload": {"input": "secret"}, "stream": True, "route": ROUTE, "route_metadata": METADATA}
+    )
     with pytest.raises(RuntimeError):
         list(stream)
     assert len(spans) == 2

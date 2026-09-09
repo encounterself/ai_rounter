@@ -161,10 +161,14 @@ class SnapshotLoaderTests(unittest.TestCase):
         self.assertTrue(any("pattern" in issue.message or "valid under" in issue.message for issue in result.issues))
 
     def test_accepts_gateway_model_services(self) -> None:
+        """Accept approved Model Services and direct Serving Endpoint references."""
+
         loader = AgentServingSnapshotLoader()
         for reference in (
             "model-services/simo_prod.ai_gateway.for_research_bedrock",
             "model-services/simo_prod.ai_gateway.route_glm",
+            "serving-endpoint/haystack-router",
+            "serving-endpoints/haystack-router-v2",
         ):
             profile = valid_profile()
             profile["model_bindings"][0]["ref"] = reference
@@ -177,6 +181,8 @@ class SnapshotLoaderTests(unittest.TestCase):
         self.assertTrue(result.accepted, result.issues)
 
     def test_rejects_unsafe_model_references(self) -> None:
+        """Reject URLs, traversal, reserved namespaces, and unapproved resources."""
+
         loader = AgentServingSnapshotLoader()
         references = (
             "system.ai.gpt",
@@ -254,6 +260,85 @@ class SnapshotLoaderTests(unittest.TestCase):
 
         self.assertFalse(result.accepted)
         self.assertTrue(any("unknown reference" in issue.message for issue in result.issues))
+
+    def test_round_trips_agent_tools_and_state_schema(self) -> None:
+        """Serialize and reload delegated tools and their state contract."""
+
+        profile = valid_profile()
+        profile["agent_graph"]["nodes"].insert(
+            2, {"id": "review", "kind": "model", "model_binding": "primary"}
+        )
+        profile["agent_graph"]["edges"] = [
+            {"source": "request", "target": "planner"},
+            {"source": "planner", "target": "response"},
+        ]
+        profile["state_schema"] = {"review_findings": {"type": "string", "persist": True}}
+        profile["agent_tools"] = [
+            {
+                "id": "review-tool",
+                "node": "review",
+                "name": "review_code",
+                "description": "Review code.",
+                "outputs_to_state": {
+                    "review_findings": {"source": "last_message", "handler": "message_text"}
+                },
+            }
+        ]
+        profile["agent_graph"]["nodes"][1]["agent_tools"] = ["review-tool"]
+
+        loader = AgentServingSnapshotLoader()
+        result = loader.load_mapping(profile)
+
+        self.assertTrue(result.accepted, result.issues)
+        assert result.snapshot is not None
+        serialized = result.snapshot.to_dict()
+        self.assertEqual(serialized["state_schema"]["review_findings"]["type"], "string")
+        self.assertEqual(
+            serialized["agent_tools"][0]["outputs_to_state"]["review_findings"]["handler"], "message_text"
+        )
+        reloaded = loader.load_mapping(serialized)
+        self.assertTrue(reloaded.accepted, reloaded.issues)
+
+    def test_rejects_agent_tool_state_unknown_reference(self) -> None:
+        """Reject AgentTool mappings that read or write undeclared state."""
+
+        profile = valid_profile()
+        profile["agent_tools"] = [
+            {
+                "id": "review-tool",
+                "node": "planner",
+                "name": "review_code",
+                "description": "Review code.",
+                "inputs_from_state": {"missing_state": "review_context"},
+            }
+        ]
+        profile["agent_graph"]["nodes"][1]["agent_tools"] = ["review-tool"]
+
+        result = AgentServingSnapshotLoader().load_mapping(profile)
+
+        self.assertFalse(result.accepted)
+        self.assertTrue(any("missing_state" in issue.message for issue in result.issues))
+
+    def test_rejects_agent_tool_delegation_cycle(self) -> None:
+        """Reject recursive specialist delegation before runtime construction."""
+
+        profile = valid_profile()
+        profile["agent_graph"]["nodes"].insert(2, {"id": "specialist", "kind": "model", "model_binding": "primary"})
+        profile["agent_graph"]["edges"] = [
+            {"source": "request", "target": "planner"},
+            {"source": "planner", "target": "response"},
+        ]
+        profile["agent_tools"] = [
+            {"id": "planner-to-specialist", "node": "specialist", "name": "delegate_specialist", "description": "Delegate."},
+            {"id": "specialist-to-planner", "node": "planner", "name": "delegate_planner", "description": "Delegate."},
+        ]
+        profile["agent_graph"]["nodes"][1]["agent_tools"] = ["planner-to-specialist"]
+        profile["agent_graph"]["nodes"][2]["agent_tools"] = ["specialist-to-planner"]
+
+        result = AgentServingSnapshotLoader().load_mapping(profile)
+
+        self.assertFalse(result.accepted)
+        self.assertTrue(any("cycle" in issue.message.lower() for issue in result.issues))
 
     def test_rejects_structurally_invalid_document_without_raising(self) -> None:
         """Return validation errors instead of raising on incomplete JSON."""

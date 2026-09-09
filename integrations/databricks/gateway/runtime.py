@@ -7,21 +7,12 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..ai_gateway import (
-    GatewayConfig,
-    GatewayRequest,
-    InMemoryRateLimiter,
-    ModelRoute,
-    RouteSelection,
-    RouteSelector,
-)
+from ..ai_gateway import GatewayConfig, GatewayRequest, InMemoryRateLimiter, ModelRoute, RouteSelection, RouteSelector
 from ..protocols import (
     InternalError,
-    InternalRequest,
     InternalResponse,
     InternalStreamEnvelope,
     ProtocolAdapterError,
-    get_protocol_adapter,
     parse_request,
     render_response,
     render_stream,
@@ -54,7 +45,8 @@ class GatewayResult:
 
 
 class GatewayRuntime:
-    """Parse, route, invoke, and render protocol requests.
+    """
+    Parse, route, invoke, and render protocol requests.
 
     The runtime has no web framework dependency.  A future Databricks Serving
     handler can pass decoded JSON into :meth:`handle` or :meth:`stream`.
@@ -72,11 +64,7 @@ class GatewayRuntime:
         self.rate_limiter = rate_limiter or InMemoryRateLimiter()
 
     def handle(
-        self,
-        protocol: str,
-        payload: Mapping[str, Any],
-        *,
-        context: RequestContext | None = None,
+        self, protocol: str, payload: Mapping[str, Any], *, context: RequestContext | None = None
     ) -> dict[str, Any]:
         """Handle a JSON request and render a protocol-specific response."""
 
@@ -84,11 +72,7 @@ class GatewayRuntime:
         return render_response(protocol, result.response)
 
     def handle_internal(
-        self,
-        protocol: str,
-        payload: Mapping[str, Any],
-        *,
-        context: RequestContext | None = None,
+        self, protocol: str, payload: Mapping[str, Any], *, context: RequestContext | None = None
     ) -> GatewayResult:
         """Handle a request while retaining routing and attempt metadata."""
 
@@ -113,9 +97,7 @@ class GatewayRuntime:
             raise
         except Exception as error:
             selection = self._fallback_selection(protocol)
-            response = InternalResponse(
-                error=InternalError(message=str(error), type="routing_error"), status="failed"
-            )
+            response = InternalResponse(error=InternalError(message=str(error), type="routing_error"), status="failed")
             return GatewayResult(response, selection, ())
 
         attempts: list[str] = []
@@ -136,9 +118,7 @@ class GatewayRuntime:
                 continue
             try:
                 response = backend.invoke(
-                    request,
-                    request_id=request_context.request_id,
-                    timeout=_route_timeout(route, request_context),
+                    request, request_id=request_context.request_id, timeout=_route_timeout(route, request_context)
                 )
                 return GatewayResult(response, selection, tuple(attempts))
             except GatewayBackendError as error:
@@ -149,17 +129,15 @@ class GatewayRuntime:
         if last_error is None:
             last_error = GatewayBackendError("no route candidate completed the request", retryable=False)
         response = InternalResponse(
-            error=InternalError(message=str(last_error), type="upstream_error", code=last_error.status_code),
+            error=InternalError(
+                message=str(last_error), type="upstream_error", code=last_error.error_code or last_error.status_code
+            ),
             status="failed",
         )
         return GatewayResult(response, selection, tuple(attempts))
 
     def stream(
-        self,
-        protocol: str,
-        payload: Mapping[str, Any],
-        *,
-        context: RequestContext | None = None,
+        self, protocol: str, payload: Mapping[str, Any], *, context: RequestContext | None = None
     ) -> Iterator[dict[str, Any] | str]:
         """Stream rendered protocol events, falling back before first output."""
 
@@ -194,9 +172,7 @@ class GatewayRuntime:
             emitted = False
             try:
                 events = backend.stream(
-                    request,
-                    request_id=request_context.request_id,
-                    timeout=_route_timeout(route, request_context),
+                    request, request_id=request_context.request_id, timeout=_route_timeout(route, request_context)
                 )
                 first = next(events, None)
                 if first is None:

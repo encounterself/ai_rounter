@@ -6,20 +6,14 @@ import hashlib
 import json
 import os
 import random
+import time
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
-
-_SECRET_PARTS = (
-    "authorization",
-    "access_token",
-    "api_key",
-    "client_secret",
-    "password",
-    "secret",
-    "token",
-)
+_SECRET_PARTS = ("authorization", "access_token", "api_key", "client_secret", "password", "secret", "token")
 _MAX_VALUE_LENGTH = 512
 
 
@@ -55,10 +49,22 @@ class TracingConfig:
 
     @classmethod
     def from_env(cls, profile: Mapping[str, Any] | None = None) -> "TracingConfig":
+        """Build tracing configuration from a profile and environment overrides."""
+
         profile = profile or {}
-        configured = profile.get("tracing", {})
-        if not isinstance(configured, Mapping):
-            configured = {}
+        configured: dict[str, Any] = {}
+        observability = profile.get("observability", {})
+        if isinstance(observability, Mapping):
+            configured.update(
+                {
+                    "enabled": observability.get("trace_enabled", False),
+                    "sampling_ratio": observability.get("sampling_ratio", 0.0),
+                    "capture_content": observability.get("capture_content", False),
+                }
+            )
+        tracing = profile.get("tracing", {})
+        if isinstance(tracing, Mapping):
+            configured.update(tracing)
 
         def value(key: str, env_name: str, default: Any = None) -> Any:
             environment_value = os.getenv(env_name)
@@ -66,7 +72,10 @@ class TracingConfig:
                 return environment_value
             return configured.get(key, default)
 
-        enabled = _as_bool(value("enabled", "MLFLOW_TRACING_ENABLED", False))
+        enabled_environment = os.getenv("MLFLOW_TRACING_ENABLED") or os.getenv("ENABLE_MLFLOW_TRACING")
+        enabled = _as_bool(
+            enabled_environment if enabled_environment not in (None, "") else configured.get("enabled", False)
+        )
         sampling_default = 1.0 if enabled else 0.0
         return cls(
             enabled=enabled,
@@ -137,12 +146,28 @@ def redact(value: Any, *, max_length: int = _MAX_VALUE_LENGTH) -> Any:
 class TraceSpan:
     """A best-effort span which never changes serving behavior on tracing failure."""
 
-    def __init__(self, config: TracingConfig, attributes: Mapping[str, Any]):
+    def __init__(self, config: TracingConfig, attributes: Mapping[str, Any]) -> None:
         self.config = config
         self.attributes = dict(attributes)
         self.span: Any = None
         self.active = False
         self._started = False
+        self._started_at = 0.0
+        self._first_token_at: float | None = None
+
+    @property
+    def trace_id(self) -> str | None:
+        """Return the logical trace identifier attached to this span."""
+
+        value = self.attributes.get("trace_id")
+        return str(value) if value is not None else None
+
+    @property
+    def span_id(self) -> str | None:
+        """Return the logical span identifier attached to this span."""
+
+        value = self.attributes.get("span_id")
+        return str(value) if value is not None else None
 
     def __enter__(self) -> "TraceSpan":
         if not self.config.enabled or self.config.sampling_ratio <= 0:
@@ -157,18 +182,14 @@ class TraceSpan:
                 "MLFLOW_TRACING_SQL_WAREHOUSE_ID": self.config.sql_warehouse_id,
             }.items():
                 if value:
-                    try:
+                    with suppress(Exception):
                         os.environ[env_name] = value
-                    except Exception:
-                        pass
 
             if self.config.experiment_name:
                 set_experiment = getattr(mlflow, "set_experiment", None)
                 if callable(set_experiment):
-                    try:
+                    with suppress(Exception):
                         set_experiment(experiment_name=self.config.experiment_name)
-                    except Exception:
-                        pass
 
             start_span = getattr(mlflow, "start_span", None)
             if not callable(start_span):
@@ -183,12 +204,9 @@ class TraceSpan:
             self.span = start_span(name="haystack-agent-router", span_type=span_type)
             self.active = True
             self._started = True
-            safe_attributes = {
-                key: _attribute_value(value) for key, value in self.attributes.items()
-            }
-            safe_attributes = {
-                key: value for key, value in safe_attributes.items() if value is not None
-            }
+            self._started_at = time.monotonic()
+            safe_attributes = {key: _attribute_value(value) for key, value in self.attributes.items()}
+            safe_attributes = {key: value for key, value in safe_attributes.items() if value is not None}
             if self.config.experiment_name:
                 safe_attributes["mlflow.experiment_name"] = self.config.experiment_name
             if self.config.beta:
@@ -208,10 +226,8 @@ class TraceSpan:
         except Exception:
             end = getattr(self.span, "end", None)
             if callable(end):
-                try:
+                with suppress(Exception):
                     end()
-                except Exception:
-                    pass
             self.span = None
             self.active = False
         return self
@@ -228,29 +244,123 @@ class TraceSpan:
             for key, value in attributes.items():
                 setter(key, value)
 
-    def finish(self, *, error: Mapping[str, Any] | None = None) -> None:
+    def _trace_metadata(self, attributes: Mapping[str, Any] | None = None) -> dict[str, str]:
+        values = {**self.attributes, **dict(attributes or {})}
+        metadata: dict[str, str] = {}
+        metadata_values = {
+            "mlflow.trace.user": values.get("user_id"),
+            "mlflow.trace.session": values.get("session_id"),
+            "haystack.trace_id": values.get("trace_id"),
+            "haystack.span_id": values.get("span_id"),
+            "haystack.correlation_id": values.get("correlation_id"),
+            "haystack.request_id": values.get("request_id"),
+            "haystack.turn_id": values.get("turn_id"),
+            "haystack.endpoint_name": values.get("endpoint_name"),
+            "haystack.served_entity_name": values.get("served_entity_name"),
+            "haystack.model": values.get("model"),
+            "haystack.models": values.get("models"),
+            "haystack.model_target": values.get("model_target"),
+            "haystack.model_targets": values.get("model_targets"),
+            "haystack.model_version": values.get("model_version"),
+            "haystack.protocol": values.get("protocol"),
+            "haystack.protocols": values.get("protocols"),
+            "haystack.provider": values.get("provider"),
+            "haystack.providers": values.get("providers"),
+            "haystack.provider_kind": values.get("provider_kind"),
+            "haystack.provider_kinds": values.get("provider_kinds"),
+            "haystack.route": values.get("route"),
+            "haystack.routes": values.get("routes"),
+            "haystack.route_attempts": values.get("route_attempts"),
+            "haystack.scenario": values.get("scenario"),
+            "haystack.tenant_id": values.get("tenant_id"),
+            "haystack.policy_route": values.get("policy_route"),
+            "haystack.mcp_binding": values.get("mcp_binding"),
+            "haystack.mcp_bindings": values.get("mcp_bindings"),
+            "haystack.skill_binding": values.get("skill_binding"),
+            "haystack.skill_bindings": values.get("skill_bindings"),
+            "haystack.prompt_binding_ids": values.get("prompt_binding_ids"),
+            "haystack.tool_count": values.get("tool_count"),
+            "haystack.tool_names": values.get("tool_names"),
+            "haystack.node_count": values.get("node_count"),
+            "haystack.nodes": values.get("nodes"),
+            "haystack.status": values.get("status"),
+            "haystack.streamed": values.get("streamed"),
+        }
+        for singular_key, plural_key in (
+            ("haystack.model", "models"),
+            ("haystack.model_target", "model_targets"),
+            ("haystack.protocol", "protocols"),
+            ("haystack.provider", "providers"),
+            ("haystack.provider_kind", "provider_kinds"),
+            ("haystack.route", "routes"),
+            ("haystack.mcp_binding", "mcp_bindings"),
+            ("haystack.skill_binding", "skill_bindings"),
+        ):
+            if values.get(plural_key):
+                metadata_values.pop(singular_key, None)
+        for key, value in metadata_values.items():
+            if value is not None:
+                metadata[key] = str(_attribute_value(value))
+        return metadata
+
+    def finish(self, *, error: Mapping[str, Any] | None = None, attributes: Mapping[str, Any] | None = None) -> None:
+        """Finish the span and attach safe outcome and latency attributes."""
+
         if not self._started or self.span is None:
             return
         try:
             if error:
-                error_attributes = {
-                    f"error.{key}": _attribute_value(value)
-                    for key, value in error.items()
-                }
-                self._set_attributes({"status": "error", **error_attributes})
+                error_attributes = {f"error.{key}": _attribute_value(value) for key, value in error.items()}
+                self._set_attributes(
+                    {
+                        "status": "error",
+                        "error_code": _attribute_value(error.get("error_code")),
+                        "http_status": _attribute_value(error.get("http_status")),
+                        **error_attributes,
+                    }
+                )
             else:
                 self._set_attributes({"status": "ok"})
+            elapsed_ms = (time.monotonic() - self._started_at) * 1000 if self._started_at else None
+            first_token_ms = (
+                (self._first_token_at - self._started_at) * 1000
+                if self._first_token_at is not None and self._started_at
+                else None
+            )
+            final_attributes = {
+                "status": "error" if error else "ok",
+                "latency_ms": elapsed_ms,
+                "time_to_first_token_ms": first_token_ms,
+                **dict(attributes or {}),
+            }
+            self._set_attributes(
+                {key: _attribute_value(value) for key, value in final_attributes.items() if value is not None}
+            )
+            update_current_trace = None
+            with suppress(Exception):
+                import mlflow
+
+                update_current_trace = getattr(mlflow, "update_current_trace", None)
+            if callable(update_current_trace) and not self.attributes.get("parent_span_id"):
+                trace_metadata = self._trace_metadata(final_attributes)
+                if trace_metadata:
+                    with suppress(Exception):
+                        update_current_trace(metadata=trace_metadata)
         except Exception:
             pass
         finally:
             end = getattr(self.span, "end", None)
             if callable(end):
-                try:
+                with suppress(Exception):
                     end()
-                except Exception:
-                    pass
             self.active = False
             self._started = False
+
+    def mark_first_token(self) -> None:
+        """Record the first emitted stream item once."""
+
+        if self._started and self._first_token_at is None:
+            self._first_token_at = time.monotonic()
 
     def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: Any) -> bool:
         if exc is None:
@@ -268,23 +378,49 @@ def start_span(
     model: str | None,
     route: str | None,
     provider: str | None,
-    metadata: Mapping[str, Any] | None = None,
-    payload: Any = None,
+    **context: Any,
 ) -> TraceSpan:
-    metadata = metadata or {}
+    """Create a sampled, redacting trace span for one serving request."""
+
+    metadata = context.get("metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
     attributes: dict[str, Any] = {
+        "trace_id": str(uuid4()),
+        "span_id": str(uuid4()),
+        "parent_span_id": context.get("parent_span_id") or metadata.get("parent_span_id"),
         "correlation_id": correlation_id,
         "request_id": request_id,
+        "session_id": context.get("session_id"),
+        "turn_id": context.get("turn_id"),
+        "user_id": context.get("user_id"),
+        "tenant_id": context.get("tenant_id"),
+        "scenario": context.get("scenario"),
+        "agent_profile": context.get("agent_profile"),
+        "component": "haystack-agent-router",
+        "protocol": context.get("protocol"),
+        "endpoint_name": context.get("endpoint_name") or os.getenv("HAYSTACK_SERVING_ENDPOINT_NAME"),
+        "served_entity_name": context.get("served_entity_name") or os.getenv("HAYSTACK_SERVED_ENTITY_NAME"),
         "model": model,
+        "model_alias": metadata.get("model_alias"),
+        "model_version": metadata.get("model_version") or os.getenv("HAYSTACK_SERVED_MODEL_VERSION"),
         "route": route,
+        "route_attempts": _safe_identifiers(metadata.get("route_attempts")),
+        "fallback_reason": metadata.get("fallback_reason"),
         "provider": provider,
+        "streamed": bool(context.get("streamed", False)),
         "tool_count": metadata.get("tool_count", 0),
         "tool_names": _safe_identifiers(metadata.get("tool_names")),
         "mcp_binding": _safe_identifier(metadata["mcp_binding"]) if metadata.get("mcp_binding") else None,
         "skill_binding": _safe_identifier(metadata["skill_binding"]) if metadata.get("skill_binding") else None,
+        "prompt_binding_ids": _safe_identifiers(metadata.get("prompt_binding_ids")),
+        "prompt_content_sha256": _safe_identifiers(metadata.get("prompt_content_sha256")),
+        "mcp_server": _safe_identifier(metadata["mcp_server"]) if metadata.get("mcp_server") else None,
+        "skill_id": _safe_identifier(metadata["skill_id"]) if metadata.get("skill_id") else None,
+        "tool_call_id": _safe_identifier(metadata["tool_call_id"]) if metadata.get("tool_call_id") else None,
+        "tool_name": _safe_identifier(metadata["tool_name"]) if metadata.get("tool_name") else None,
     }
-    if config.capture_content and payload is not None:
-        attributes["input"] = redact(payload)
+    if config.capture_content and context.get("payload") is not None:
+        attributes["input"] = redact(context["payload"])
     return TraceSpan(config, attributes)
 
 
@@ -298,6 +434,8 @@ def safe_error_attributes(
     http_status: int | None = None,
     error_code: str | None = None,
 ) -> dict[str, Any]:
+    """Build bounded error attributes safe to expose to serving callers."""
+
     return {
         key: value
         for key, value in {

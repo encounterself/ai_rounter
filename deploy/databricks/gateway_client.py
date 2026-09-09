@@ -6,12 +6,12 @@ import json
 import os
 import re
 import uuid
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any
 from urllib.parse import quote
 
 import httpx
-
 
 DEFAULT_ROUTE = "model-services/simo_prod.ai_models.route_claude-haiku-4-5"
 ROUTE_PREFIX = "model-services/"
@@ -115,15 +115,19 @@ class SafeError:
     error_code: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {key: value for key, value in {
-            "correlation_id": self.correlation_id,
-            "route": self.route,
-            "provider_host": self.provider_host,
-            "provider_path": self.provider_path,
-            "exception_type": self.exception_type,
-            "http_status": self.http_status,
-            "error_code": self.error_code,
-        }.items() if value is not None}
+        return {
+            key: value
+            for key, value in {
+                "correlation_id": self.correlation_id,
+                "route": self.route,
+                "provider_host": self.provider_host,
+                "provider_path": self.provider_path,
+                "exception_type": self.exception_type,
+                "http_status": self.http_status,
+                "error_code": self.error_code,
+            }.items()
+            if value is not None
+        }
 
 
 def new_correlation_id() -> str:
@@ -196,13 +200,20 @@ class ManagedAuth:
                 ) from exc
         serving_environment = _is_model_serving_environment()
         m2m_configured = serving_environment and _has_m2m_environment()
-        auth_strategy = "m2m" if m2m_configured else ("obo" if serving_environment else "default")
+        workload_identity = serving_environment and _as_bool(
+            os.getenv("DATABRICKS_SERVING_USE_WORKLOAD_IDENTITY"), False
+        )
+        auth_strategy = (
+            "m2m"
+            if m2m_configured
+            else ("workload_identity" if workload_identity else ("obo" if serving_environment else "default"))
+        )
         try:
             from databricks.sdk import WorkspaceClient
 
             if m2m_configured:
                 client = WorkspaceClient(auth_type="oauth-m2m")
-            elif serving_environment:
+            elif serving_environment and not workload_identity:
                 from databricks_ai_bridge import ModelServingUserCredentials
 
                 client = WorkspaceClient(credentials_strategy=ModelServingUserCredentials())
@@ -246,6 +257,12 @@ def _is_model_serving_environment() -> bool:
     return serving_flag or os.path.isfile(_MODEL_SERVING_OAUTH_FILE)
 
 
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _has_m2m_environment() -> bool:
     """Detect injected M2M references without logging or exposing their values."""
 
@@ -256,11 +273,7 @@ class GatewayClient:
     """Call a configured model-services or system.ai Serving route."""
 
     def __init__(
-        self,
-        settings: GatewaySettings,
-        *,
-        auth: ManagedAuth | None = None,
-        client: httpx.Client | None = None,
+        self, settings: GatewaySettings, *, auth: ManagedAuth | None = None, client: httpx.Client | None = None
     ):
         self.settings = settings
         self.auth = auth or ManagedAuth()
@@ -279,14 +292,10 @@ class GatewayClient:
             or _SERVING_ENDPOINT_ROUTE_RE.fullmatch(route)
         )
         if not approved or (not explicitly_approved and not valid_route):
-            raise RouteValidationError(
-                "route is not approved",
-                {"error_code": "route_not_allowed", "route": route},
-            )
+            raise RouteValidationError("route is not approved", {"error_code": "route_not_allowed", "route": route})
         if metadata is None:
             raise RouteValidationError(
-                "route metadata is required",
-                {"error_code": "route_metadata_missing", "route": route},
+                "route metadata is required", {"error_code": "route_metadata_missing", "route": route}
             )
         if metadata.get("enabled") is False:
             raise RouteValidationError("route is unavailable", {"error_code": "route_unavailable", "route": route})
@@ -294,14 +303,12 @@ class GatewayClient:
             endpoint = _direct_endpoint_name(route, metadata)
             if not isinstance(endpoint, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", endpoint):
                 raise RouteValidationError(
-                    "system.ai Serving endpoint is invalid",
-                    {"error_code": "serving_endpoint_invalid", "route": route},
+                    "system.ai Serving endpoint is invalid", {"error_code": "serving_endpoint_invalid", "route": route}
                 )
         for binding in ("mcp_binding", "skill_binding", "prompt_binding"):
             if metadata.get(binding) in (False, "", None) and binding in metadata:
                 raise RouteValidationError(
-                    "route binding is invalid",
-                    {"error_code": f"{binding}_invalid", "route": route},
+                    "route binding is invalid", {"error_code": f"{binding}_invalid", "route": route}
                 )
 
     def invoke(
@@ -336,11 +343,7 @@ class GatewayClient:
                         path=path,
                         error_code="managed_auth_failed",
                     ),
-                    **{
-                        key: value
-                        for key, value in exc.diagnostic.items()
-                        if key in {"auth_stage", "auth_strategy"}
-                    },
+                    **{key: value for key, value in exc.diagnostic.items() if key in {"auth_stage", "auth_strategy"}},
                 },
             ) from exc
         body = _responses_to_chat(payload) if not use_responses else dict(payload)
@@ -353,12 +356,7 @@ class GatewayClient:
         try:
             if stream:
                 return self._stream_request(
-                    body,
-                    headers,
-                    correlation_id=correlation_id,
-                    route=route,
-                    base_url=base_url,
-                    path=path,
+                    body, headers, correlation_id=correlation_id, route=route, base_url=base_url, path=path
                 )
             response = self.client.post(base_url + path, json=body, headers=headers)
         except Exception as exc:
@@ -470,12 +468,7 @@ class GatewayClient:
             ) from exc
 
     def _stream_json(
-        self,
-        response: httpx.Response,
-        correlation_id: str,
-        route: str,
-        base_url: str,
-        path: str,
+        self, response: httpx.Response, correlation_id: str, route: str, base_url: str, path: str
     ) -> Iterator[dict[str, Any]]:
         try:
             for line in response.iter_lines():
@@ -570,22 +563,18 @@ def _route_protocol(default: str, metadata: Mapping[str, Any]) -> str:
     return protocol
 
 
-def _route_target(
-    settings: GatewaySettings, route: str, metadata: Mapping[str, Any]
-) -> tuple[str, str]:
+def _route_target(settings: GatewaySettings, route: str, metadata: Mapping[str, Any]) -> tuple[str, str]:
     """Resolve the URL base and invocation path for one selected route."""
 
     if _is_direct_serving_route(route, metadata):
         if not settings.workspace_host:
             raise ConfigurationError(
-                "DATABRICKS_HOST is required for system.ai Serving routes",
-                {"error_code": "missing_workspace_host"},
+                "DATABRICKS_HOST is required for system.ai Serving routes", {"error_code": "missing_workspace_host"}
             )
         endpoint = _direct_endpoint_name(route, metadata)
         if endpoint is None:
             raise ConfigurationError(
-                "system.ai Serving endpoint metadata is required",
-                {"error_code": "serving_endpoint_invalid"},
+                "system.ai Serving endpoint metadata is required", {"error_code": "serving_endpoint_invalid"}
             )
         return settings.workspace_host, f"/serving-endpoints/{quote(endpoint, safe='')}/invocations"
     protocol = _route_protocol(settings.protocol, metadata)
@@ -606,9 +595,6 @@ def _responses_to_chat(payload: Mapping[str, Any]) -> dict[str, Any]:
         role = item.get("role", "user")
         content = item.get("content", "")
         if isinstance(content, list):
-            content = "".join(
-                str(part.get("text", "")) if isinstance(part, Mapping) else str(part)
-                for part in content
-            )
+            content = "".join(str(part.get("text", "")) if isinstance(part, Mapping) else str(part) for part in content)
         messages.append({"role": role, "content": content})
     return {"messages": messages}

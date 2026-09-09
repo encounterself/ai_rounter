@@ -3,10 +3,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from integrations.databricks.serving_endpoints import (
-    DatabricksServingEndpointsClient,
-    ServingEndpointsHTTPError,
-)
+from integrations.databricks.serving_endpoints import DatabricksServingEndpointsClient, ServingEndpointsHTTPError
 
 
 def test_list_get_and_openapi_parse_endpoint_payloads() -> None:
@@ -17,9 +14,7 @@ def test_list_get_and_openapi_parse_endpoint_payloads() -> None:
         if request.url.path == "/api/2.0/serving-endpoints":
             if request.url.params.get("page_token") == "next":
                 return httpx.Response(
-                    200,
-                    json={"endpoints": [{"name": "endpoint-two", "state": {"ready": "READY"}}]},
-                    request=request,
+                    200, json={"endpoints": [{"name": "endpoint-two", "state": {"ready": "READY"}}]}, request=request
                 )
             return httpx.Response(
                 200,
@@ -49,9 +44,7 @@ def test_list_get_and_openapi_parse_endpoint_payloads() -> None:
         if request.url.path.endswith("/openapi"):
             return httpx.Response(200, json={"openapi": "3.0.0", "paths": {"/invocations": {}}}, request=request)
         return httpx.Response(
-            200,
-            json={"name": "endpoint-one", "state": {"ready": "READY"}, "config": {}},
-            request=request,
+            200, json={"name": "endpoint-one", "state": {"ready": "READY"}, "config": {}}, request=request
         )
 
     with DatabricksServingEndpointsClient(
@@ -72,9 +65,7 @@ def test_list_get_and_openapi_parse_endpoint_payloads() -> None:
 def test_http_errors_redact_authentication_and_secret_values() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
-            403,
-            json={"error": "denied", "token": "workspace-secret", "api_key": "provider-secret"},
-            request=request,
+            403, json={"error": "denied", "token": "workspace-secret", "api_key": "provider-secret"}, request=request
         )
 
     with DatabricksServingEndpointsClient(

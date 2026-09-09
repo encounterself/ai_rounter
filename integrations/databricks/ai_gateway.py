@@ -1,4 +1,5 @@
-"""Pure configuration and routing primitives for the gateway runtime.
+"""
+Pure configuration and routing primitives for the gateway runtime.
 
 The classes in this module are intentionally transport-free.  They validate a
 draft, resolve references to Databricks Model Services or Serving Endpoints,
@@ -11,9 +12,9 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict, deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 from .protocols import UnsupportedProtocolError, get_protocol_adapter, normalize_protocol
 
@@ -178,10 +179,7 @@ class GatewayConfig:
                 }
                 for route in self.routes
             ],
-            "fallback": {
-                "route_ids": list(self.fallback.route_ids),
-                "max_attempts": self.fallback.max_attempts,
-            },
+            "fallback": {"route_ids": list(self.fallback.route_ids), "max_attempts": self.fallback.max_attempts},
             "default_protocols": list(self.default_protocols),
             "revision": self.revision,
             "metadata": dict(self.metadata),
@@ -285,6 +283,9 @@ class RouteSelector:
             route
             for route in self.config.routes
             if route.enabled
+            and (
+                request.metadata.get("route_id") in (None, route.id) if isinstance(request.metadata, Mapping) else True
+            )
             and route.supports_protocol(request.protocol, self._providers[route.provider].protocols)
             and route.matches_model(request.model)
         ]

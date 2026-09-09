@@ -12,6 +12,7 @@ from urllib.parse import quote
 import httpx
 
 from ..protocols import (
+    PROTOCOL_OPENAI_RESPONSES,
     InternalRequest,
     InternalResponse,
     InternalStreamEnvelope,
@@ -24,9 +25,17 @@ from ..protocols import (
 class GatewayBackendError(RuntimeError):
     """Base error raised by a gateway backend."""
 
-    def __init__(self, message: str, *, retryable: bool = True, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = True,
+        status_code: int | None = None,
+        error_code: str | int | None = None,
+    ) -> None:
         self.retryable = retryable
         self.status_code = status_code
+        self.error_code = error_code
         super().__init__(_redact(message))
 
 
@@ -34,10 +43,12 @@ class GatewayBackendHTTPError(GatewayBackendError):
     """Raised for an unsuccessful upstream provider response."""
 
     def __init__(self, status_code: int, url: str, body: str) -> None:
+        error_code = _response_error_code(body)
         super().__init__(
             f"upstream gateway request failed with HTTP {status_code} for {_redact(url)}: {_redact(body)}",
             retryable=status_code >= 500 or status_code == 429,
             status_code=status_code,
+            error_code=error_code,
         )
 
 
@@ -122,10 +133,7 @@ class _HTTPGatewayBackend:
         payload = self._render_request(request)
         try:
             response = self._client.post(
-                self._request_path(),
-                json=payload,
-                headers=self._request_headers(request_id),
-                timeout=timeout,
+                self._request_path(), json=payload, headers=self._request_headers(request_id), timeout=timeout
             )
         except httpx.RequestError as error:
             raise GatewayBackendError(f"upstream gateway request failed: {error}") from error
@@ -147,11 +155,7 @@ class _HTTPGatewayBackend:
         payload = self._render_request(replace(request, stream=True))
         try:
             response_context = self._client.stream(
-                "POST",
-                self._request_path(),
-                json=payload,
-                headers=self._request_headers(request_id),
-                timeout=timeout,
+                "POST", self._request_path(), json=payload, headers=self._request_headers(request_id), timeout=timeout
             )
             with response_context as response:
                 self._check_response(response)
@@ -197,28 +201,48 @@ class DatabricksServingBackend(_HTTPGatewayBackend):
         *,
         protocol: str = "mlflow_chat",
         token: str | None = None,
+        headers: Mapping[str, str] | None = None,
         client: httpx.Client | None = None,
         transport: httpx.BaseTransport | None = None,
         timeout: float | httpx.Timeout = 60.0,
         model: str | None = None,
     ) -> None:
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
-        path = f"/serving-endpoints/{quote(endpoint_name, safe='')}/invocations"
+        request_headers = dict(headers or {})
+        if token:
+            request_headers["Authorization"] = f"Bearer {token}"
+        if protocol == PROTOCOL_OPENAI_RESPONSES:
+            path = "/serving-endpoints/responses"
+            resolved_model = model or endpoint_name
+        else:
+            path = f"/serving-endpoints/{quote(endpoint_name, safe='')}/invocations"
+            resolved_model = model
         super().__init__(
             host,
             protocol=protocol,
             path=path,
-            headers=headers,
+            headers=request_headers,
             client=client,
             transport=transport,
             timeout=timeout,
-            model=model,
+            model=resolved_model,
         )
         self.endpoint_name = endpoint_name
 
+    def _render_request(self, request: InternalRequest) -> dict[str, Any]:
+        if self.protocol == PROTOCOL_OPENAI_RESPONSES:
+            request = replace(
+                request,
+                messages=tuple(
+                    replace(message, role="developer") if message.role == "assistant" else message
+                    for message in request.messages
+                ),
+            )
+        return super()._render_request(request)
+
 
 class DatabricksFoundationModelBackend(DatabricksServingBackend):
-    """Backend for a Databricks ``system.ai`` chat endpoint.
+    """
+    Backend for a Databricks ``system.ai`` chat endpoint.
 
     Foundation Model API endpoints use the OpenAI-compatible ``llm/v1/chat``
     contract.  The invocation URL is still the standard Serving Endpoint path,
@@ -232,6 +256,7 @@ class DatabricksFoundationModelBackend(DatabricksServingBackend):
         endpoint_name: str,
         *,
         token: str | None = None,
+        headers: Mapping[str, str] | None = None,
         client: httpx.Client | None = None,
         transport: httpx.BaseTransport | None = None,
         timeout: float | httpx.Timeout = 60.0,
@@ -242,6 +267,7 @@ class DatabricksFoundationModelBackend(DatabricksServingBackend):
             endpoint_name,
             protocol="chat_completions",
             token=token,
+            headers=headers,
             client=client,
             transport=transport,
             timeout=timeout,
@@ -250,7 +276,8 @@ class DatabricksFoundationModelBackend(DatabricksServingBackend):
 
 
 class OpenAICompatibleBackend(_HTTPGatewayBackend):
-    """Backend for an explicitly configured OpenAI/Codex-compatible HTTP API.
+    """
+    Backend for an explicitly configured OpenAI/Codex-compatible HTTP API.
 
     Codex integration is intentionally HTTP-only: this class never invokes a
     shell command or a local CLI.  The caller supplies the provider base URL,
@@ -262,6 +289,7 @@ class OpenAICompatibleBackend(_HTTPGatewayBackend):
         base_url: str,
         *,
         api_key: str | None = None,
+        headers: Mapping[str, str] | None = None,
         protocol: str = "openai_responses",
         path: str | None = None,
         model: str | None = None,
@@ -269,12 +297,14 @@ class OpenAICompatibleBackend(_HTTPGatewayBackend):
         transport: httpx.BaseTransport | None = None,
         timeout: float | httpx.Timeout = 60.0,
     ) -> None:
-        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        request_headers = dict(headers or {})
+        if api_key:
+            request_headers["Authorization"] = f"Bearer {api_key}"
         super().__init__(
             base_url,
             protocol=protocol,
             path=path,
-            headers=headers,
+            headers=request_headers,
             client=client,
             transport=transport,
             timeout=timeout,
@@ -290,6 +320,7 @@ class AnthropicBackend(_HTTPGatewayBackend):
         base_url: str,
         *,
         api_key: str | None = None,
+        headers: Mapping[str, str] | None = None,
         protocol: str = "anthropic_messages",
         path: str = "/v1/messages",
         model: str | None = None,
@@ -297,14 +328,14 @@ class AnthropicBackend(_HTTPGatewayBackend):
         transport: httpx.BaseTransport | None = None,
         timeout: float | httpx.Timeout = 60.0,
     ) -> None:
-        headers = {"anthropic-version": "2023-06-01"}
+        request_headers = {"anthropic-version": "2023-06-01", **dict(headers or {})}
         if api_key:
-            headers["x-api-key"] = api_key
+            request_headers["x-api-key"] = api_key
         super().__init__(
             base_url,
             protocol=protocol,
             path=path,
-            headers=headers,
+            headers=request_headers,
             client=client,
             transport=transport,
             timeout=timeout,
@@ -342,6 +373,21 @@ def _redact(value: str) -> str:
         flags=re.IGNORECASE,
     )
     return result
+
+
+def _response_error_code(body: str) -> str | None:
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    error = payload.get("error")
+    if isinstance(error, Mapping) and error.get("code") is not None:
+        return str(error["code"])
+    if payload.get("error_code") is not None:
+        return str(payload["error_code"])
+    return None
 
 
 __all__ = [

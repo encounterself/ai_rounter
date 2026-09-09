@@ -1,4 +1,5 @@
-"""Register the current Haystack runtime and publish a Serving endpoint.
+"""
+Register the current Haystack runtime and publish a Serving endpoint.
 
 Run this from a Databricks notebook or deployment job with Managed MLflow
 authentication. It never places a PAT or provider credential in the model.
@@ -9,23 +10,75 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
 import subprocess
+from pathlib import Path
 from typing import Any
 
 import mlflow
-from mlflow.models.auth_policy import AuthPolicy, UserAuthPolicy
+from mlflow.models.auth_policy import AuthPolicy, SystemAuthPolicy, UserAuthPolicy
+from mlflow.models.resources import Resource, ResourceType
+
+
+class DatabricksAutoscalingPostgres(Resource):
+    """Declare a modern Lakebase Autoscaling project for system auth."""
+
+    def __init__(self, project_name: str, database_name: str = "databricks_postgres") -> None:
+        self.project_name = project_name
+        self.database_name = database_name
+
+    @property
+    def target_uri(self) -> str:
+        return "databricks"
+
+    @property
+    def type(self) -> ResourceType:
+        return ResourceType.LAKEBASE
+
+    def to_dict(self) -> dict[str, list[dict[str, str]]]:
+        return {"postgres": [{"name": self.project_name, "database_name": self.database_name}]}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, str]) -> "DatabricksAutoscalingPostgres":
+        return cls(data["name"], data.get("database_name", "databricks_postgres"))
+
 
 try:
-    from .endpoint_config import build_endpoint_config, build_served_entity, build_update_config
+    from .endpoint_config import (
+        build_endpoint_config,
+        build_served_entity,
+        build_session_environment,
+        build_update_config,
+    )
 except ImportError:  # MLflow loads this file as a top-level script.
-    from endpoint_config import build_endpoint_config, build_served_entity, build_update_config
+    from endpoint_config import (
+        build_endpoint_config,
+        build_served_entity,
+        build_session_environment,
+        build_update_config,
+    )
 
 
-def obo_auth_policy() -> AuthPolicy:
-    """Authorize model-serving calls with the invoking user's identity."""
+def lakebase_resource_name(endpoint: str | None) -> str | None:
+    """Return the autoscaling Lakebase project resource for a session endpoint."""
 
-    return AuthPolicy(user_auth_policy=UserAuthPolicy(api_scopes=["model-serving"]))
+    if not endpoint:
+        return None
+    prefix, separator, _ = endpoint.partition("/branches/")
+    if not separator or not prefix.startswith("projects/"):
+        raise ValueError("session Lakebase endpoint must identify a projects/<project> resource")
+    return prefix
+
+
+def obo_auth_policy(*, lakebase_resource: str | None = None) -> AuthPolicy:
+    """Authorize serving dependencies and optional Lakebase system access."""
+
+    system_auth_policy = None
+    if lakebase_resource:
+        system_auth_policy = SystemAuthPolicy(resources=[DatabricksAutoscalingPostgres(lakebase_resource)])
+    return AuthPolicy(
+        user_auth_policy=UserAuthPolicy(api_scopes=["model-serving", "ai-gateway"]),
+        system_auth_policy=system_auth_policy,
+    )
 
 
 def profile_secret_refs(profile_path: Path) -> tuple[str | None, str | None]:
@@ -66,6 +119,7 @@ def register_model(
     profile_path: Path,
     model_name: str,
     experiment_name: str | None = None,
+    lakebase_resource: str | None = None,
 ) -> str:
     """Register the current code model and return its exact registered version."""
 
@@ -73,16 +127,21 @@ def register_model(
     mlflow.set_registry_uri("databricks-uc")
     if experiment_name:
         mlflow.set_experiment(experiment_name)
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    log_model_options: dict[str, Any] = {}
+    if not (isinstance(profile, dict) and "schema_version" in profile and "agent_graph" in profile):
+        log_model_options["input_example"] = {"input": [{"role": "user", "content": "health check"}], "stream": False}
+    repository_root = deploy_dir.parent.parent
     with mlflow.start_run() as run:
         model_info = mlflow.pyfunc.log_model(
             artifact_path="router",
             python_model=str(deploy_dir / "agent.py"),
-            code_paths=[str(deploy_dir)],
+            code_paths=[str(deploy_dir), str(repository_root / "integrations"), str(repository_root / "contracts")],
             artifacts={"profile": str(profile_path)},
             pip_requirements=str(deploy_dir / "requirements.txt"),
-            input_example={"input": [{"role": "user", "content": "health check"}], "stream": False},
-            auth_policy=obo_auth_policy(),
+            auth_policy=obo_auth_policy(lakebase_resource=lakebase_resource),
             registered_model_name=model_name,
+            **log_model_options,
         )
         print(f"registered run: {run.info.run_id}")
     registered_version = getattr(model_info, "registered_model_version", None)
@@ -101,6 +160,7 @@ def write_endpoint_config(
     client_id_secret_ref: str | None = None,
     client_secret_secret_ref: str | None = None,
     tracing_environment: dict[str, str] | None = None,
+    session_environment: dict[str, str] | None = None,
     owner: str,
 ) -> dict[str, Any]:
     served_entity = build_served_entity(
@@ -108,10 +168,12 @@ def write_endpoint_config(
         model_name=model_name,
         model_version=model_version,
         workspace_id=workspace_id,
+        serving_endpoint_name=endpoint_name,
         workspace_host=workspace_host,
         client_id_secret_ref=client_id_secret_ref,
         client_secret_secret_ref=client_secret_secret_ref,
         tracing_environment=tracing_environment,
+        session_environment=session_environment,
     )
     return build_update_config(served_entity)
 
@@ -126,6 +188,7 @@ def write_create_endpoint_config(
     client_id_secret_ref: str | None = None,
     client_secret_secret_ref: str | None = None,
     tracing_environment: dict[str, str] | None = None,
+    session_environment: dict[str, str] | None = None,
     owner: str,
 ) -> dict[str, Any]:
     served_entity = build_served_entity(
@@ -133,16 +196,14 @@ def write_create_endpoint_config(
         model_name=model_name,
         model_version=model_version,
         workspace_id=workspace_id,
+        serving_endpoint_name=endpoint_name,
         workspace_host=workspace_host,
         client_id_secret_ref=client_id_secret_ref,
         client_secret_secret_ref=client_secret_secret_ref,
         tracing_environment=tracing_environment,
+        session_environment=session_environment,
     )
-    return build_endpoint_config(
-        endpoint_name=endpoint_name,
-        served_entity=served_entity,
-        owner=owner,
-    )
+    return build_endpoint_config(endpoint_name=endpoint_name, served_entity=served_entity, owner=owner)
 
 
 def update_endpoint_with_cli(*, endpoint_name: str, config_path: Path, cli_profile: str) -> None:
@@ -173,6 +234,17 @@ def main() -> None:
     parser.add_argument("--workspace-host", default=os.getenv("DATABRICKS_HOST"))
     parser.add_argument("--client-id-secret-ref")
     parser.add_argument("--client-secret-secret-ref")
+    parser.add_argument("--session-lakebase-endpoint")
+    parser.add_argument("--session-database", default="test_ontos")
+    parser.add_argument("--session-database-user")
+    parser.add_argument(
+        "--session-use-user-auth",
+        action="store_true",
+        help="Use the invoking user's OBO identity for Lakebase instead of the endpoint workload identity.",
+    )
+    parser.add_argument("--session-table", default="haystack_agent_sessions")
+    parser.add_argument("--session-ttl-seconds", type=float)
+    parser.add_argument("--no-session-auto-migrate", action="store_true")
     parser.add_argument("--owner", default="")
     parser.add_argument("--config-out", type=Path, default=Path("/tmp/haystack-agent-router-update.json"))
     parser.add_argument("--cli-profile", default="DEFAULT")
@@ -187,12 +259,22 @@ def main() -> None:
     tracing_environment = profile_tracing_environment(args.profile)
     client_id_secret_ref = args.client_id_secret_ref or profile_client_id_ref
     client_secret_secret_ref = args.client_secret_secret_ref or profile_client_secret_ref
+    session_environment = build_session_environment(
+        lakebase_endpoint=args.session_lakebase_endpoint,
+        database=args.session_database,
+        database_user=args.session_database_user,
+        table=args.session_table,
+        auto_migrate=not args.no_session_auto_migrate,
+        ttl_seconds=args.session_ttl_seconds,
+        use_user_auth=args.session_use_user_auth,
+    )
 
     version = register_model(
         deploy_dir=args.deploy_dir,
         profile_path=args.profile,
         model_name=args.model_name,
         experiment_name=args.experiment_name,
+        lakebase_resource=lakebase_resource_name(args.session_lakebase_endpoint),
     )
     result = write_endpoint_config(
         endpoint_name=args.endpoint_name,
@@ -203,14 +285,13 @@ def main() -> None:
         client_id_secret_ref=client_id_secret_ref,
         client_secret_secret_ref=client_secret_secret_ref,
         tracing_environment=tracing_environment,
+        session_environment=session_environment,
         owner=args.owner,
     )
     args.config_out.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     if args.update_endpoint:
         update_endpoint_with_cli(
-            endpoint_name=args.endpoint_name,
-            config_path=args.config_out,
-            cli_profile=args.cli_profile,
+            endpoint_name=args.endpoint_name, config_path=args.config_out, cli_profile=args.cli_profile
         )
     print(
         json.dumps(

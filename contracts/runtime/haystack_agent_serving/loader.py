@@ -28,6 +28,7 @@ _SCHEMA_PATH = Path(__file__).with_name("schema") / "agent-serving.schema.json"
 _MODEL_REF_PATTERNS = (
     re.compile(r"^model-services/simo_prod\.ai_models\.route_[a-z0-9][a-z0-9_-]{0,127}$"),
     re.compile(r"^model-services/simo_prod\.ai_gateway\.[a-z0-9][a-z0-9_-]{0,127}$"),
+    re.compile(r"^serving-endpoints?/[A-Za-z0-9][A-Za-z0-9_.-]{0,126}$"),
 )
 _LOGICAL_REF_RE = re.compile(r"^[a-z][a-z0-9._-]{0,127}$")
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9._-]{0,127}$")
@@ -92,6 +93,17 @@ class GraphNode:
     skill_bindings: tuple[str, ...] = ()
     prompt_bindings: tuple[str, ...] = ()
     policy_route: str | None = None
+    agent_tools: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class AgentToolBinding:
+    id: str
+    node: str
+    name: str
+    description: str
+    inputs_from_state: Mapping[str, str] = MappingProxyType({})
+    outputs_to_state: Mapping[str, Mapping[str, Any]] = MappingProxyType({})
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +160,8 @@ class AgentServingSnapshot:
     prompt_bindings: Mapping[str, PromptBinding]
     observability: ObservabilityPolicy
     content_sha256: str
+    agent_tools: Mapping[str, AgentToolBinding] = MappingProxyType({})
+    state_schema: Mapping[str, Mapping[str, Any]] = MappingProxyType({})
 
     def to_dict(self) -> dict[str, Any]:
         """Return a detached JSON-compatible copy of the immutable snapshot."""
@@ -171,6 +185,7 @@ class AgentServingSnapshot:
                         **({"skill_bindings": list(node.skill_bindings)} if node.skill_bindings else {}),
                         **({"prompt_bindings": list(node.prompt_bindings)} if node.prompt_bindings else {}),
                         **({"policy_route": node.policy_route} if node.policy_route is not None else {}),
+                        **({"agent_tools": list(node.agent_tools)} if node.agent_tools else {}),
                     }
                     for node in self.agent_graph.nodes
                 ],
@@ -210,6 +225,18 @@ class AgentServingSnapshot:
                 }
                 for binding in self.model_bindings.values()
             ],
+            "agent_tools": [
+                {
+                    "id": binding.id,
+                    "node": binding.node,
+                    "name": binding.name,
+                    "description": binding.description,
+                    "inputs_from_state": dict(binding.inputs_from_state),
+                    "outputs_to_state": {key: dict(value) for key, value in binding.outputs_to_state.items()},
+                }
+                for binding in self.agent_tools.values()
+            ],
+            "state_schema": {key: dict(value) for key, value in self.state_schema.items()},
             "mcp_bindings": [
                 {"id": binding.id, "ref": binding.ref, "tools": list(binding.tools)}
                 for binding in self.mcp_bindings.values()
@@ -285,12 +312,7 @@ class AgentServingSnapshotLoader:
         for error in sorted(self._validator.iter_errors(raw), key=lambda item: list(item.absolute_path)):
             path = _json_path(error.absolute_path)
             if path.startswith("$/model_bindings/") and path.endswith("/ref"):
-                schema_issues.append(
-                    ValidationIssue(
-                        path,
-                        _model_ref_error(raw, error.absolute_path),
-                    )
-                )
+                schema_issues.append(ValidationIssue(path, _model_ref_error(raw, error.absolute_path)))
             else:
                 schema_issues.append(ValidationIssue(path, error.message))
         if schema_issues:
@@ -322,6 +344,19 @@ def _build_snapshot(raw: Mapping[str, Any]) -> AgentServingSnapshot:
         )
         for item in raw["model_bindings"]
     }
+    agent_tools = {
+        item["id"]: AgentToolBinding(
+            id=item["id"],
+            node=item["node"],
+            name=item.get("name", item["id"]),
+            description=item["description"],
+            inputs_from_state=MappingProxyType(dict(item.get("inputs_from_state", {}))),
+            outputs_to_state=MappingProxyType(
+                {key: MappingProxyType(dict(value)) for key, value in item.get("outputs_to_state", {}).items()}
+            ),
+        )
+        for item in raw.get("agent_tools", ())
+    }
     mcp_bindings = {
         item["id"]: McpBinding(id=item["id"], ref=item["ref"], tools=tuple(item.get("tools", ())))
         for item in raw["mcp_bindings"]
@@ -342,6 +377,7 @@ def _build_snapshot(raw: Mapping[str, Any]) -> AgentServingSnapshot:
                 skill_bindings=tuple(node.get("skill_bindings", ())),
                 prompt_bindings=tuple(node.get("prompt_bindings", ())),
                 policy_route=node.get("policy_route"),
+                agent_tools=tuple(node.get("agent_tools", ())),
             )
             for node in graph_data["nodes"]
         ),
@@ -382,6 +418,10 @@ def _build_snapshot(raw: Mapping[str, Any]) -> AgentServingSnapshot:
         prompt_bindings=prompt_bindings,
         observability=observability,
         content_sha256=hashlib.sha256(detached).hexdigest(),
+        agent_tools=MappingProxyType(agent_tools),
+        state_schema=MappingProxyType(
+            {key: MappingProxyType(dict(value)) for key, value in raw.get("state_schema", {}).items()}
+        ),
     )
 
 
@@ -407,9 +447,26 @@ def _semantic_issues(raw: Mapping[str, Any]) -> list[ValidationIssue]:
     skill_store_ids = unique_ids(raw["skills_registry"]["stores"], "/skills_registry/stores")
     skill_manifest_ids = unique_ids(raw["skills_registry"]["skills"], "/skills_registry/skills")
     prompt_ids = unique_ids(raw["prompt_bindings"], "/prompt_bindings")
+    agent_tool_ids = unique_ids(raw.get("agent_tools", ()), "/agent_tools")
+    state_schema = raw.get("state_schema", {})
+    state_ids = set(state_schema)
     graph_data = raw["agent_graph"]
     node_ids = unique_ids(graph_data["nodes"], "/agent_graph/nodes")
     route_ids = unique_ids(raw["policy_router"]["routes"], "/policy_router/routes")
+
+    reserved_state_keys = {"messages", "step_count", "token_usage", "tool_call_counts", "exit_reason"}
+    for state_key, definition in state_schema.items():
+        if not _IDENTIFIER_RE.fullmatch(str(state_key)):
+            issues.append(ValidationIssue(f"/state_schema/{state_key}", "state key must be a valid identifier"))
+        if state_key in reserved_state_keys:
+            issues.append(ValidationIssue(f"/state_schema/{state_key}", "state key is reserved by Haystack Agent"))
+        if definition.get("handler") == "append" and definition.get("type") not in {"array", "list"}:
+            issues.append(
+                ValidationIssue(
+                    f"/state_schema/{state_key}/handler",
+                    "append state handler requires an array/list state field",
+                )
+            )
 
     _require_ref(graph_data["entry_node"], node_ids, "/agent_graph/entry_node", issues)
     for index, terminal in enumerate(graph_data["terminal_nodes"]):
@@ -418,6 +475,13 @@ def _semantic_issues(raw: Mapping[str, Any]) -> list[ValidationIssue]:
         _require_ref(edge["source"], node_ids, f"/agent_graph/edges/{index}/source", issues)
         _require_ref(edge["target"], node_ids, f"/agent_graph/edges/{index}/target", issues)
     for index, node in enumerate(graph_data["nodes"]):
+        if node.get("agent_tools") and node.get("kind") != "model":
+            issues.append(
+                ValidationIssue(
+                    f"/agent_graph/nodes/{index}/agent_tools",
+                    "AgentTool bindings may only be attached to model nodes",
+                )
+            )
         _require_ref(node.get("model_binding"), model_ids, f"/agent_graph/nodes/{index}/model_binding", issues)
         _require_ref(node.get("mcp_binding"), mcp_ids, f"/agent_graph/nodes/{index}/mcp_binding", issues)
         _require_refs(node.get("skill_bindings", ()), skill_ids, f"/agent_graph/nodes/{index}/skill_bindings", issues)
@@ -425,6 +489,32 @@ def _semantic_issues(raw: Mapping[str, Any]) -> list[ValidationIssue]:
             node.get("prompt_bindings", ()), prompt_ids, f"/agent_graph/nodes/{index}/prompt_bindings", issues
         )
         _require_ref(node.get("policy_route"), route_ids, f"/agent_graph/nodes/{index}/policy_route", issues)
+        _require_refs(node.get("agent_tools", ()), agent_tool_ids, f"/agent_graph/nodes/{index}/agent_tools", issues)
+    for index, binding in enumerate(raw.get("agent_tools", ())):
+        _require_ref(binding.get("node"), node_ids, f"/agent_tools/{index}/node", issues)
+        for state_key, source in binding.get("inputs_from_state", {}).items():
+            _require_ref(
+                state_key,
+                state_ids,
+                f"/agent_tools/{index}/inputs_from_state/{state_key}",
+                issues,
+            )
+            if not isinstance(source, str) or not _IDENTIFIER_RE.fullmatch(source):
+                issues.append(
+                    ValidationIssue(
+                        f"/agent_tools/{index}/inputs_from_state/{state_key}",
+                        "mapped Agent input name must be a valid identifier",
+                    )
+                )
+        for state_key in binding.get("outputs_to_state", {}):
+            _require_ref(
+                state_key,
+                state_ids,
+                f"/agent_tools/{index}/outputs_to_state/{state_key}",
+                issues,
+            )
+
+    _validate_agent_tool_targets(raw, node_ids, issues)
     for index, route in enumerate(raw["policy_router"]["routes"]):
         _require_ref(route.get("model_binding"), model_ids, f"/policy_router/routes/{index}/model_binding", issues)
         _require_ref(route.get("mcp_binding"), mcp_ids, f"/policy_router/routes/{index}/mcp_binding", issues)
@@ -442,6 +532,73 @@ def _semantic_issues(raw: Mapping[str, Any]) -> list[ValidationIssue]:
     return issues
 
 
+def _validate_agent_tool_targets(
+    raw: Mapping[str, Any], node_ids: set[str], issues: list[ValidationIssue]
+) -> None:
+    """Validate AgentTool target kinds and reject recursive delegation graphs."""
+
+    nodes = {node["id"]: node for node in raw["agent_graph"]["nodes"] if isinstance(node, Mapping)}
+    bindings = {binding["id"]: binding for binding in raw.get("agent_tools", ()) if isinstance(binding, Mapping)}
+    outgoing: dict[str, list[tuple[str, str]]] = {}
+    for index, binding in enumerate(raw.get("agent_tools", ())):
+        target = binding.get("node")
+        target_node = nodes.get(target)
+        if target not in node_ids:
+            continue
+        if target_node is None or target_node.get("kind") != "model":
+            issues.append(
+                ValidationIssue(
+                    f"/agent_tools/{index}/node",
+                    "AgentTool target must reference a model node",
+                )
+            )
+
+    for node_index, node in enumerate(raw["agent_graph"]["nodes"]):
+        source = node.get("id")
+        for tool_index, binding_id in enumerate(node.get("agent_tools", ())):
+            binding = bindings.get(binding_id)
+            if binding is None:
+                continue
+            target = binding.get("node")
+            if target in nodes and nodes[target].get("kind") == "model":
+                outgoing.setdefault(source, []).append((target, binding_id))
+            if len([item for item in node.get("agent_tools", ()) if item == binding_id]) > 1:
+                issues.append(
+                    ValidationIssue(
+                        f"/agent_graph/nodes/{node_index}/agent_tools/{tool_index}",
+                        f"duplicate AgentTool reference: {binding_id}",
+                    )
+                )
+
+    visiting: list[str] = []
+    visited: set[str] = set()
+    reported: set[tuple[str, ...]] = set()
+
+    def visit(node_id: str) -> None:
+        if node_id in visiting:
+            cycle = tuple(visiting[visiting.index(node_id) :] + [node_id])
+            normalized = tuple(sorted(set(cycle)))
+            if normalized not in reported:
+                reported.add(normalized)
+                issues.append(
+                    ValidationIssue(
+                        "/agent_tools",
+                        f"AgentTool delegation cycle detected: {' -> '.join(cycle)}",
+                    )
+                )
+            return
+        if node_id in visited:
+            return
+        visiting.append(node_id)
+        for target, _binding_id in outgoing.get(node_id, ()):
+            visit(target)
+        visiting.pop()
+        visited.add(node_id)
+
+    for node_id in nodes:
+        visit(node_id)
+
+
 def _forbidden_content_issues(value: Any, path: str = "$") -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     if isinstance(value, Mapping):
@@ -455,8 +612,11 @@ def _forbidden_content_issues(value: Any, path: str = "$") -> list[ValidationIss
             issues.extend(_forbidden_content_issues(child, f"{path}/{index}"))
     elif isinstance(value, str):
         normalized = value.strip().lower()
-        if normalized.startswith("system.") or "system.ai." in normalized:
-            issues.append(ValidationIssue(path, "system.* references are forbidden; foundation models are not bindings"))
+        is_mcp_endpoint = path.startswith("$/mcp_endpoints/")
+        if (normalized.startswith("system.") or "system.ai." in normalized) and not is_mcp_endpoint:
+            issues.append(
+                ValidationIssue(path, "system.* references are forbidden; foundation models are not bindings")
+            )
         if _FORBIDDEN_RESOURCE_PREFIX in normalized.split("/", maxsplit=1)[-1][: len(_FORBIDDEN_RESOURCE_PREFIX)]:
             issues.append(ValidationIssue(path, "resources with the agent_ prefix are forbidden"))
         if "supervisor agent" in normalized or normalized == "supervisor" or "supervisor_agent" in normalized:
@@ -471,10 +631,10 @@ def _model_ref_error(raw: Mapping[str, Any], path: Sequence[Any]) -> str:
     for part in path:
         value = value[part]
     if isinstance(value, str) and re.match(r"^system(?:\.|$)", value):
-        return "system.* foundation models cannot be declared as model bindings"
+        return f"{value}: system.* foundation models cannot be declared as model bindings"
     if isinstance(value, str) and any(pattern.fullmatch(value) for pattern in _MODEL_REF_PATTERNS):
-        return "model ref must be an approved model-services resource"
-    return "model ref must match an approved model-services resource prefix and complete resource name"
+        return "model ref must be an approved Serving Endpoint or Model Services resource"
+    return "model ref must be valid under an approved Serving Endpoint or Model Services resource pattern"
 
 
 def _require_ref(value: str | None, available: set[str], path: str, issues: list[ValidationIssue]) -> None:
